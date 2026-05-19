@@ -28,6 +28,9 @@ class ReasoningStoreTests(unittest.TestCase):
             store.put("b", "reasoning b", {"role": "assistant"})
             store.put("c", "reasoning c", {"role": "assistant"})
 
+            store.flush()
+            store.prune()
+
             self.assertIsNone(store.get("a"))
             self.assertEqual(store.get("b"), "reasoning b")
             self.assertEqual(store.get("c"), "reasoning c")

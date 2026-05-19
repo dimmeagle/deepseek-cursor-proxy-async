@@ -27,6 +27,7 @@ classifiers = [
 ]
 dependencies = [
     "PyYAML>=6.0",
+    "orjson>=3.10.0",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +35,10 @@ dev = [
     "black==24.2.0",
     "pre-commit>=3.0.0",
     "ruff>=0.3.0",
+]
+diagnose = [
+    "psutil>=5.9.0",
+    "orjson>=3.10.0",
 ]
 
 [project.scripts]

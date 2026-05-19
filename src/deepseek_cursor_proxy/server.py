@@ -4,8 +4,8 @@ import argparse
 from dataclasses import dataclass, replace
 import gzip
 from http.client import HTTPException
-import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import orjson
 from pathlib import Path
 import sys
 import time
@@ -216,9 +216,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if self.config.verbose:
             log_json("upstream request body", prepared.payload)
 
-        upstream_body = json.dumps(
-            prepared.payload, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
+        upstream_body = orjson.dumps(prepared.payload)
         upstream_url = f"{self.config.upstream_base_url}/chat/completions"
         upstream_headers = self._upstream_headers(
             stream=bool(prepared.payload.get("stream")),
@@ -390,9 +388,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         *,
         trace: TraceRequest | None = None,
     ) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        body = orjson.dumps(payload)
         if trace is not None:
             trace.record_cursor_response(
                 status=status,
@@ -483,8 +479,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if not raw_body:
             raise ValueError("Request body is empty")
         try:
-            payload = json.loads(raw_body.decode("utf-8"))
-        except json.JSONDecodeError as exc:
+            payload = orjson.loads(raw_body)
+        except ValueError as exc:
             raise ValueError(f"Invalid JSON: {exc}") from exc
         if not isinstance(payload, dict):
             raise ValueError("Request body must be a JSON object")
@@ -589,8 +585,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 display_reasoning=self.config.display_reasoning,
                 collapsible_reasoning=self.config.collapsible_reasoning,
             )
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        except (ValueError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
+
+        if self.reasoning_store is not None:
+            self.reasoning_store.flush()
 
         if self.config.verbose:
             log_bytes("cursor response body", body)
@@ -607,8 +606,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 stream=False,
             )
             try:
-                upstream_payload = json.loads(upstream_body.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                upstream_payload = orjson.loads(upstream_body)
+            except (ValueError, UnicodeDecodeError):
                 upstream_payload = None
             if isinstance(upstream_payload, dict):
                 trace.record_usage(upstream_payload.get("usage"))
@@ -752,6 +751,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         "stored %s streaming reasoning cache key(s) before exit",
                         stored,
                     )
+            if self.reasoning_store is not None:
+                self.reasoning_store.flush()
         return ProxyResponseResult(True, usage)
 
     def _rewrite_sse_line(
@@ -771,38 +772,26 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
         data = stripped[len(b"data:") :].strip()
         if data == b"[DONE]":
-            if self.config.verbose:
-                log_json("model streaming assistant messages", accumulator.messages())
-            stored = sum(
-                accumulator.store_reasoning(
-                    self.reasoning_store,
-                    scope,
-                    cache_namespace,
-                    prior_messages,
-                )
-                for scope, prior_messages in response_contexts
+            return self._handle_done(
+                accumulator,
+                cache_namespace,
+                response_contexts,
+                display_adapter,
+                original_model,
+                recovery_notice,
             )
-            if self.config.verbose and stored:
-                LOG.info("stored %s streaming reasoning cache key(s)", stored)
-            prefix = b""
-            if display_adapter is None:
-                if recovery_notice:
-                    prefix += sse_data(
-                        recovery_notice_chunk(original_model, recovery_notice)
-                    )
-                return prefix + b"data: [DONE]\n\n", True, None, None
-            closing_chunk = display_adapter.flush_chunk(original_model)
-            if closing_chunk is not None:
-                prefix += sse_data(closing_chunk)
-            if recovery_notice:
-                prefix += sse_data(
-                    recovery_notice_chunk(original_model, recovery_notice)
-                )
-            return prefix + b"data: [DONE]\n\n", True, None, None
+
+        # Fast path: skip JSON parsing when no modification is needed
+        if (
+            not self.config.display_reasoning
+            and self.reasoning_store is None
+            and original_model == self.config.upstream_model
+        ):
+            return line, False, recovery_notice, None
 
         try:
-            chunk = json.loads(data.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            chunk = orjson.loads(data)
+        except (ValueError, UnicodeDecodeError):
             return line, False, recovery_notice, None
 
         if isinstance(chunk, dict):
@@ -831,9 +820,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             return (
                 (
                     b"data: "
-                    + json.dumps(
-                        chunk, ensure_ascii=False, separators=(",", ":")
-                    ).encode("utf-8")
+                    + orjson.dumps(chunk)
                     + ending
                 ),
                 False,
@@ -841,6 +828,44 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 chunk_usage if isinstance(chunk_usage, dict) else None,
             )
         return line, False, recovery_notice, None
+
+    def _handle_done(
+        self,
+        accumulator: StreamAccumulator,
+        cache_namespace: str,
+        response_contexts: list[tuple[str, list[dict[str, Any]]]],
+        display_adapter: CursorReasoningDisplayAdapter | None,
+        original_model: str,
+        recovery_notice: str | None,
+    ) -> tuple[bytes, bool, str | None, dict[str, Any] | None]:
+        if self.config.verbose:
+            log_json("model streaming assistant messages", accumulator.messages())
+        stored = sum(
+            accumulator.store_reasoning(
+                self.reasoning_store,
+                scope,
+                cache_namespace,
+                prior_messages,
+            )
+            for scope, prior_messages in response_contexts
+        )
+        if self.config.verbose and stored:
+            LOG.info("stored %s streaming reasoning cache key(s)", stored)
+        prefix = b""
+        if display_adapter is None:
+            if recovery_notice:
+                prefix += sse_data(
+                    recovery_notice_chunk(original_model, recovery_notice)
+                )
+            return prefix + b"data: [DONE]\n\n", True, None, None
+        closing_chunk = display_adapter.flush_chunk(original_model)
+        if closing_chunk is not None:
+            prefix += sse_data(closing_chunk)
+        if recovery_notice:
+            prefix += sse_data(
+                recovery_notice_chunk(original_model, recovery_notice)
+            )
+        return prefix + b"data: [DONE]\n\n", True, None, None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -989,14 +1014,14 @@ def log_json(label: str, payload: Any) -> None:
     LOG.info(
         "%s:\n%s",
         label,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        orjson.dumps(payload, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode("utf-8"),
     )
 
 
 def log_bytes(label: str, body: bytes) -> None:
     try:
-        payload = json.loads(body.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = orjson.loads(body)
+    except (ValueError, UnicodeDecodeError):
         LOG.info("%s:\n%s", label, body.decode("utf-8", errors="replace"))
         return
     log_json(label, payload)
@@ -1004,8 +1029,8 @@ def log_bytes(label: str, body: bytes) -> None:
 
 def usage_from_body(body: bytes) -> dict[str, Any] | None:
     try:
-        payload = json.loads(body.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = orjson.loads(body)
+    except (ValueError, UnicodeDecodeError):
         return None
     if isinstance(payload, dict):
         usage = payload.get("usage")
@@ -1153,11 +1178,7 @@ def int_or_zero(value: Any) -> int:
 
 
 def sse_data(payload: dict[str, Any]) -> bytes:
-    return (
-        b"data: "
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        + b"\n\n"
-    )
+    return b"data: " + orjson.dumps(payload) + b"\n\n"
 
 
 def inject_recovery_notice(chunk: dict[str, Any], notice: str) -> bool:

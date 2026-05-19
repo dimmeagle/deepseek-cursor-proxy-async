@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import orjson
 from pathlib import Path
 import sqlite3
 import threading
@@ -194,9 +195,16 @@ class ReasoningStore:
                 mode=0o700, parents=True, exist_ok=True
             )
         self._lock = threading.RLock()
+        self._batch: list[tuple[str, str, dict[str, Any]]] = []
+        self._batch_size = 100
+        self._prune_counter = 0
+        self._prune_every_n_writes = 500
         self._conn = sqlite3.connect(
             self.reasoning_content_path, check_same_thread=False
         )
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         if isinstance(self.reasoning_content_path, Path):
             self.reasoning_content_path.chmod(0o600)
         self._conn.execute(
@@ -214,29 +222,54 @@ class ReasoningStore:
 
     def close(self) -> None:
         with self._lock:
+            self.flush()
             self._conn.close()
 
     def put(self, key: str, reasoning: str, message: dict[str, Any]) -> None:
         if not isinstance(reasoning, str):
             return
-        message_json = json.dumps(message, ensure_ascii=False, sort_keys=True)
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO reasoning_cache(key, reasoning, message_json, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    reasoning = excluded.reasoning,
-                    message_json = excluded.message_json,
-                    created_at = excluded.created_at
-                """,
-                (key, reasoning, message_json, time.time()),
-            )
+            self._batch.append((key, reasoning, message))
+            if len(self._batch) >= self._batch_size:
+                self._flush_batch()
+
+    def flush(self) -> None:
+        with self._lock:
+            self._flush_batch()
+
+    def _flush_batch(self) -> None:
+        if not self._batch:
+            return
+        base = time.time()
+        self._conn.executemany(
+            """
+            INSERT INTO reasoning_cache(key, reasoning, message_json, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                reasoning = excluded.reasoning,
+                message_json = excluded.message_json,
+                created_at = excluded.created_at
+            """,
+            [
+                (
+                    k,
+                    r,
+                    orjson.dumps(m, option=orjson.OPT_SORT_KEYS).decode("utf-8"),
+                    base + i * 0.001,
+                )
+                for i, (k, r, m) in enumerate(self._batch)
+            ],
+        )
+        self._prune_counter += len(self._batch)
+        if self._prune_counter >= self._prune_every_n_writes:
             self._prune_locked()
-            self._conn.commit()
+            self._prune_counter = 0
+        self._conn.commit()
+        self._batch.clear()
 
     def get(self, key: str) -> str | None:
         with self._lock:
+            self._flush_batch()
             row = self._conn.execute(
                 "SELECT reasoning FROM reasoning_cache WHERE key = ?",
                 (key,),
@@ -306,6 +339,7 @@ class ReasoningStore:
 
     def clear(self) -> int:
         with self._lock:
+            self._flush_batch()
             row = self._conn.execute("SELECT COUNT(*) FROM reasoning_cache").fetchone()
             count = int(row[0] if row else 0)
             self._conn.execute("DELETE FROM reasoning_cache")

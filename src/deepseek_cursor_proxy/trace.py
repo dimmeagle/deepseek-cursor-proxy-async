@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
-import json
+import orjson
 import os
 from pathlib import Path
 import threading
@@ -41,11 +41,10 @@ def sanitized_headers(headers: dict[str, str] | None) -> dict[str, Any]:
 
 
 def jsonable_body(body: bytes) -> dict[str, Any]:
-    text = body.decode("utf-8", errors="replace")
     try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return {"text": text}
+        payload = orjson.loads(body)
+    except ValueError:
+        return {"text": body.decode("utf-8", errors="replace")}
     return {"json": payload}
 
 
@@ -72,7 +71,7 @@ def content_stats(content: Any) -> dict[str, Any]:
     elif isinstance(content, str):
         text = content
     else:
-        text = json.dumps(content, ensure_ascii=False, sort_keys=True)
+        text = orjson.dumps(content, option=orjson.OPT_SORT_KEYS).decode("utf-8")
     return {"length": len(text), "sha256": sha256_text(text)}
 
 
@@ -141,9 +140,9 @@ def payload_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
 def write_json_private(path: Path, payload: dict[str, Any]) -> None:
     tmp_path = path.with_name(f".{path.name}.tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    tmp_path.write_bytes(
+        orjson.dumps(payload, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS)
+        + b"\n",
     )
     tmp_path.chmod(0o600)
     tmp_path.replace(path)
@@ -226,11 +225,12 @@ class TraceRequest:
 
     def record_cursor_body_bytes(self, body: bytes) -> None:
         self.data["request"]["body_bytes"] = len(body)
-        text = body.decode("utf-8", errors="replace")
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            self.data["request"]["body"] = {"text": text}
+            payload = orjson.loads(body)
+        except ValueError:
+            self.data["request"]["body"] = {
+                "text": body.decode("utf-8", errors="replace")
+            }
             return
         self.data["request"]["body"] = payload
         if isinstance(payload, dict):

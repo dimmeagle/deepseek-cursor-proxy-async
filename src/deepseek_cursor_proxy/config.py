@@ -31,6 +31,10 @@ DEFAULT_CORS = False
 DEFAULT_MISSING_REASONING_STRATEGY = "recover"
 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_REASONING_CACHE_MAX_ROWS = 100_000
+DEFAULT_MAX_CONTEXT_MESSAGES = 0
+DEFAULT_MAX_CONTEXT_TOKENS = 0
+DEFAULT_TRIM_REASONING_CONTENT = False
+DEFAULT_MAX_REASONING_CHARS = 5000
 
 DEFAULT_CONFIG_HEADER = (
     "# This file was created automatically at ~/.deepseek-cursor-proxy/config.yaml."
@@ -59,6 +63,10 @@ reasoning_content_path: {REASONING_CONTENT_FILE_NAME}
 missing_reasoning_strategy: {DEFAULT_MISSING_REASONING_STRATEGY}
 reasoning_cache_max_age_seconds: {DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS}
 reasoning_cache_max_rows: {DEFAULT_REASONING_CACHE_MAX_ROWS}
+# max_context_messages: {DEFAULT_MAX_CONTEXT_MESSAGES}
+# max_context_tokens: {DEFAULT_MAX_CONTEXT_TOKENS}
+# trim_reasoning_content: {str(DEFAULT_TRIM_REASONING_CONTENT).lower()}
+# max_reasoning_chars: {DEFAULT_MAX_REASONING_CHARS}
 """
 
 
@@ -212,6 +220,10 @@ class ProxyConfig:
     ngrok: bool = DEFAULT_NGROK
     ngrok_url: str | None = None
     trace_dir: Path | None = None
+    max_context_messages: int = DEFAULT_MAX_CONTEXT_MESSAGES
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
+    trim_reasoning_content: bool = DEFAULT_TRIM_REASONING_CONTENT
+    max_reasoning_chars: int = DEFAULT_MAX_REASONING_CHARS
 
     @classmethod
     def from_file(
@@ -292,4 +304,20 @@ class ProxyConfig:
                 DEFAULT_NGROK,
             ),
             ngrok_url=as_optional_str(setting_value(settings, "ngrok_url")),
+            max_context_messages=as_int(
+                setting_value(settings, "max_context_messages"),
+                DEFAULT_MAX_CONTEXT_MESSAGES,
+            ),
+            max_context_tokens=as_int(
+                setting_value(settings, "max_context_tokens"),
+                DEFAULT_MAX_CONTEXT_TOKENS,
+            ),
+            trim_reasoning_content=as_bool(
+                setting_value(settings, "trim_reasoning_content"),
+                DEFAULT_TRIM_REASONING_CONTENT,
+            ),
+            max_reasoning_chars=as_int(
+                setting_value(settings, "max_reasoning_chars"),
+                DEFAULT_MAX_REASONING_CHARS,
+            ),
         )

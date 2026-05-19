@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import orjson
 import re
 from typing import Any
 
@@ -156,7 +157,16 @@ def extract_text_content(content: Any) -> str | None:
     return str(content)
 
 
+_THINK_TAG = "<think"
+_DETAILS_TAG = "<details"
+
+
 def strip_cursor_thinking_blocks(content: str) -> str:
+    # Fast path: if there's no thinking/think/details tag at all, skip the
+    # expensive regex.  The regex is the #1 CPU hotspot (70 % in cProfile)
+    # and ~90% of messages have no blocks to strip.
+    if _THINK_TAG not in content and _DETAILS_TAG not in content:
+        return content
     return CURSOR_THINKING_BLOCK_RE.sub("", content).lstrip("\r\n")
 
 
@@ -734,6 +744,32 @@ def response_recording_contexts(
     return contexts
 
 
+def trim_messages(
+    messages: list[dict[str, Any]],
+    max_messages: int = 0,
+) -> list[dict[str, Any]]:
+    """Trim history to the last N messages, preserving system messages."""
+    if max_messages <= 0 or len(messages) <= max_messages:
+        return messages
+    system = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
+    return system + non_system[-(max_messages - len(system)):]
+
+
+def trim_reasoning(
+    message: dict[str, Any],
+    max_chars: int = 5000,
+) -> dict[str, Any]:
+    """Trim reasoning_content to max_chars characters."""
+    if max_chars <= 0:
+        return message
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and len(reasoning) > max_chars:
+        message = dict(message)
+        message["reasoning_content"] = reasoning[:max_chars] + "\n...[truncated]"
+    return message
+
+
 def prepare_upstream_request(
     payload: dict[str, Any],
     config: ProxyConfig,
@@ -867,6 +903,16 @@ def prepare_upstream_request(
     )
     prepared["messages"] = strip_recovery_notice_for_upstream(messages)
 
+    if config.max_context_messages > 0:
+        prepared["messages"] = trim_messages(
+            prepared["messages"], config.max_context_messages
+        )
+    if config.trim_reasoning_content and config.max_reasoning_chars > 0:
+        prepared["messages"] = [
+            trim_reasoning(m, config.max_reasoning_chars)
+            for m in prepared["messages"]
+        ]
+
     return PreparedRequest(
         payload=prepared,
         original_model=original_model,
@@ -940,7 +986,7 @@ def rewrite_response_body(
     display_reasoning: bool = False,
     collapsible_reasoning: bool = True,
 ) -> bytes:
-    response_payload = json.loads(body.decode("utf-8"))
+    response_payload = orjson.loads(body)
     if isinstance(response_payload, dict):
         if content_prefix:
             prefix_response_content(response_payload, content_prefix)
@@ -957,9 +1003,7 @@ def rewrite_response_body(
             fold_reasoning_into_content(response_payload, collapsible_reasoning)
         if "model" in response_payload:
             response_payload["model"] = original_model
-    return json.dumps(
-        response_payload, ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
+    return orjson.dumps(response_payload)
 
 
 def prefix_response_content(response_payload: dict[str, Any], prefix: str) -> bool:
