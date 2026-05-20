@@ -13,8 +13,10 @@ This file is the ground truth for "does the proxy speak DeepSeek correctly?"
 from __future__ import annotations
 
 from copy import deepcopy
+import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import sys
 import threading
 import time
 import unittest
@@ -24,7 +26,7 @@ from urllib.request import Request, urlopen
 
 from deepseek_cursor_proxy.config import ProxyConfig
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
-from deepseek_cursor_proxy.server import DeepSeekProxyHandler, DeepSeekProxyServer
+from deepseek_cursor_proxy.server import create_app
 
 
 # Canonical fake-DeepSeek reasoning/answer text reused across tests.
@@ -261,8 +263,7 @@ def _start_proxy(
     store: ReasoningStore,
     **config_overrides: Any,
 ) -> _Fixture:
-    proxy = DeepSeekProxyServer(("127.0.0.1", 0), DeepSeekProxyHandler)
-    proxy.config = ProxyConfig(
+    config = ProxyConfig(
         upstream_base_url=upstream_url,
         upstream_model="deepseek-v4-pro",
         ngrok=False,
@@ -270,8 +271,49 @@ def _start_proxy(
         cors=False,
         **config_overrides,
     )
-    proxy.reasoning_store = store
-    return _Fixture(proxy)
+    started = threading.Event()
+    port_holder: list[int] = []
+
+    def run() -> None:
+        if sys.platform == "win32":
+            loop = asyncio.SelectorEventLoop()
+        else:
+            loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_start_aiohttp(config, store, started, port_holder))
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    started.wait(timeout=10)
+
+    class _ProxyFixture:
+        url = f"http://127.0.0.1:{port_holder[0]}"
+
+        def close(self) -> None:
+            pass  # daemon thread stops automatically
+
+    return _ProxyFixture()  # type: ignore[return-value]
+
+
+async def _start_aiohttp(
+    config: ProxyConfig,
+    store: ReasoningStore,
+    started: threading.Event,
+    port_holder: list[int],
+) -> None:
+    app = create_app(config, store)
+    runner = app.on_startup[0]  # just to get the handler started
+    from aiohttp import web
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port_holder.append(site._server.sockets[0].getsockname()[1])
+    started.set()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
 
 
 def _post(

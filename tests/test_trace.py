@@ -3,10 +3,12 @@ through the proxy (captures real request flow on disk)."""
 
 from __future__ import annotations
 
+import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import stat
+import sys
 import threading
 from tempfile import TemporaryDirectory
 import time
@@ -16,7 +18,7 @@ from urllib.request import Request, urlopen
 
 from deepseek_cursor_proxy.config import ProxyConfig
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
-from deepseek_cursor_proxy.server import DeepSeekProxyHandler, DeepSeekProxyServer
+from deepseek_cursor_proxy.server import create_app
 from deepseek_cursor_proxy.trace import TraceWriter
 
 
@@ -172,6 +174,37 @@ def _read_single_trace(session_dir: Path) -> dict:
     return json.loads(files[0].read_text(encoding="utf-8"))
 
 
+async def _start_trace_aiohttp(
+    upstream_url: str,
+    store: ReasoningStore,
+    writer: TraceWriter,
+    started: threading.Event,
+    port_holder: list[int],
+) -> None:
+    config = ProxyConfig(
+        upstream_base_url=upstream_url,
+        upstream_model="deepseek-v4-pro",
+        ngrok=False,
+    )
+    app = create_app(config, store)
+
+    # Attach the trace writer by mutating the handler (hacky but works)
+    # The handler is created in create_app and stored on the app.
+    app._handler.trace_writer = writer  # type: ignore[attr-defined]
+
+    from aiohttp import web
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port_holder.append(site._server.sockets[0].getsockname()[1])
+    started.set()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+
+
 class TraceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         _CannedUpstream.requests = []
@@ -179,25 +212,36 @@ class TraceIntegrationTests(unittest.TestCase):
         self.store = ReasoningStore(":memory:")
         self.temp_dir = TemporaryDirectory()
         self.writer = TraceWriter(self.temp_dir.name)
-        proxy = DeepSeekProxyServer(("127.0.0.1", 0), DeepSeekProxyHandler)
-        proxy.config = ProxyConfig(
-            upstream_base_url=self.upstream.url,
-            upstream_model="deepseek-v4-pro",
-            ngrok=False,
-        )
-        proxy.reasoning_store = self.store
-        proxy.trace_writer = self.writer
-        self.proxy = _Fixture(proxy)
+
+        started = threading.Event()
+        port_holder: list[int] = []
+
+        def run() -> None:
+            if sys.platform == "win32":
+                loop = asyncio.SelectorEventLoop()
+            else:
+                loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(
+                _start_trace_aiohttp(
+                    self.upstream.url, self.store, self.writer,
+                    started, port_holder,
+                )
+            )
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        started.wait(timeout=10)
+        self._proxy_url = f"http://127.0.0.1:{port_holder[0]}"
 
     def tearDown(self) -> None:
-        self.proxy.close()
         self.upstream.close()
         self.store.close()
         self.temp_dir.cleanup()
 
     def _post(self, payload: dict) -> dict:
         request = Request(
-            f"{self.proxy.url}/v1/chat/completions",
+            f"{self._proxy_url}/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={
@@ -210,7 +254,7 @@ class TraceIntegrationTests(unittest.TestCase):
 
     def test_traces_unsupported_post_path_with_body(self) -> None:
         request = Request(
-            f"{self.proxy.url}/v1/summarize",
+            f"{self._proxy_url}/v1/summarize",
             data=json.dumps(
                 {
                     "model": "gpt-4o-mini",
@@ -262,7 +306,7 @@ class TraceIntegrationTests(unittest.TestCase):
 
     def test_captures_streaming_replay_chunks(self) -> None:
         request = Request(
-            f"{self.proxy.url}/v1/chat/completions",
+            f"{self._proxy_url}/v1/chat/completions",
             data=json.dumps(
                 {
                     "model": "deepseek-v4-pro",

@@ -1,19 +1,26 @@
+"""Local OpenAI-compatible proxy for Cursor DeepSeek reasoning models.
+
+Async HTTP server built on aiohttp. Replaced the original
+ThreadingHTTPServer + urllib implementation for better concurrency.
+"""
+
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import dataclass, replace
 import gzip
-from http.client import HTTPException
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import orjson
 from pathlib import Path
 import sys
 import time
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 import zlib
+
+from aiohttp import web
+from aiohttp.client import ClientResponse
+from aiohttp import ClientSession, ClientTimeout, TCPConnector
 
 from .config import (
     ProxyConfig,
@@ -46,105 +53,144 @@ class ProxyResponseResult:
     usage: dict[str, Any] | None = None
 
 
-class DeepSeekProxyServer(ThreadingHTTPServer):
-    config: ProxyConfig
-    reasoning_store: ReasoningStore
-    trace_writer: TraceWriter | None
+SERVER_VERSION = "DeepSeekPythonProxy/0.1"
 
 
-class DeepSeekProxyHandler(BaseHTTPRequestHandler):
-    server_version = "DeepSeekPythonProxy/0.1"
+# ---------------------------------------------------------------------------
+# Handler — one instance per application (shared across requests)
+# ---------------------------------------------------------------------------
 
-    @property
-    def config(self) -> ProxyConfig:
-        return self.server.config  # type: ignore[return-value]
 
-    @property
-    def reasoning_store(self) -> ReasoningStore:
-        return self.server.reasoning_store  # type: ignore[return-value]
+class DeepSeekProxyHandler:
+    """Async HTTP handler for the DeepSeek Cursor proxy.
 
-    @property
-    def trace_writer(self) -> TraceWriter | None:
-        return getattr(self.server, "trace_writer", None)
+    Uses a single aiohttp ``ClientSession`` (created in ``start()``) for
+    all upstream requests.  The session lives as long as the application.
+    """
 
-    def log_message(self, fmt: str, *args: Any) -> None:
-        return
+    def __init__(
+        self,
+        config: ProxyConfig,
+        reasoning_store: ReasoningStore,
+        trace_writer: TraceWriter | None,
+    ) -> None:
+        self.config = config
+        self.reasoning_store = reasoning_store
+        self.trace_writer = trace_writer
+        self._session: ClientSession | None = None
 
-    def do_OPTIONS(self) -> None:
-        request_path = urlparse(self.path).path
-        if self.config.verbose:
-            LOG.info(
-                "incoming OPTIONS %s from %s",
-                request_path,
-                self.client_address[0],
+    async def start(self) -> None:
+        """Create the shared HTTP client session."""
+        connector = TCPConnector(
+            limit=100,
+            limit_per_host=10,
+            enable_cleanup_closed=True,
+            force_close=False,  # keep-alive + HTTP/2 multiplexing
+        )
+        self._session = ClientSession(
+            connector=connector,
+            timeout=ClientTimeout(total=self.config.request_timeout),
+        )
+
+    async def stop(self) -> None:
+        """Close the shared HTTP client session."""
+        if self._session is not None:
+            await self._session.close()
+
+    # ── Route handlers ────────────────────────────────────────────────
+
+    async def healthz(self, request: web.Request) -> web.Response:
+        return web.json_response({"ok": True})
+
+    async def models(self, request: web.Request) -> web.Response:
+        created = int(time.time())
+        model_ids = list(
+            dict.fromkeys(
+                [
+                    self.config.upstream_model,
+                    "deepseek-v4-pro",
+                    "deepseek-v4-flash",
+                ]
             )
-        self._send_response_headers(204, [], "sending CORS preflight response")
+        )
+        models_list = [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": created,
+                "owned_by": "deepseek",
+            }
+            for model_id in model_ids
+        ]
+        return web.json_response({"object": "list", "data": models_list})
 
-    def do_GET(self) -> None:
-        request_path = urlparse(self.path).path
-        if self.config.verbose:
-            LOG.info("incoming GET %s from %s", request_path, self.client_address[0])
-        if request_path in {"/healthz", "/v1/healthz"}:
-            self._send_json(200, {"ok": True})
-            return
-        if request_path in {"/models", "/v1/models"}:
-            self._send_models()
-            return
-        self._send_json(404, {"error": {"message": "Not found"}})
-
-    def do_POST(self) -> None:
+    async def chat_completions(
+        self, request: web.Request
+    ) -> web.StreamResponse | web.Response:
         started = time.monotonic()
-        request_path = urlparse(self.path).path
-        trace = self._start_trace(request_path)
+        request_path = request.path
+        trace = self._start_trace(request_path, request)
+
         if self.config.verbose:
             LOG.info(
                 "incoming POST %s from %s content_length=%s user_agent=%s",
                 request_path,
-                self.client_address[0],
-                self.headers.get("Content-Length", "0"),
-                self.headers.get("User-Agent", ""),
+                request.remote,
+                request.headers.get("Content-Length", "0"),
+                request.headers.get("User-Agent", ""),
             )
+
+        # ── Path check ────────────────────────────────────────────
         if request_path not in {"/chat/completions", "/v1/chat/completions"}:
-            LOG.warning("rejected unsupported POST path=%s status=404", request_path)
-            self._record_request_body_for_trace(trace)
-            self._send_json(
-                404,
-                {"error": {"message": "Only /v1/chat/completions is supported"}},
-                trace=trace,
+            LOG.warning(
+                "rejected unsupported POST path=%s status=404", request_path
             )
+            await self._record_request_body_for_trace(request, trace)
             self._finish_trace(trace, "rejected", http_status=404)
-            return
-        cursor_authorization = self._cursor_authorization()
+            return web.json_response(
+                {"error": {"message": "Only /v1/chat/completions is supported"}},
+                status=404,
+            )
+
+        # ── Authorization ─────────────────────────────────────────
+        cursor_authorization = self._cursor_authorization(request)
         if cursor_authorization is None:
             LOG.warning(
                 "rejected request path=%s status=401 reason=missing_bearer_token",
                 request_path,
             )
-            self._record_request_body_for_trace(trace)
-            self._send_json(
-                401,
-                {"error": {"message": "Missing Authorization bearer token"}},
-                trace=trace,
-            )
+            await self._record_request_body_for_trace(request, trace)
             self._finish_trace(trace, "rejected", http_status=401)
-            return
+            return web.json_response(
+                {"error": {"message": "Missing Authorization bearer token"}},
+                status=401,
+            )
 
+        # ── Read request body ─────────────────────────────────────
         try:
-            payload = self._read_json_body()
+            payload = await self._read_json_body(request)
         except RequestBodyTooLarge as exc:
             LOG.warning(
-                "rejected request path=%s status=413 reason=%s", request_path, exc
+                "rejected request path=%s status=413 reason=%s",
+                request_path,
+                exc,
             )
-            self._send_json(413, {"error": {"message": str(exc)}}, trace=trace)
             self._finish_trace(trace, "rejected", http_status=413, reason=str(exc))
-            return
+            return web.json_response(
+                {"error": {"message": str(exc)}}, status=413
+            )
         except ValueError as exc:
             LOG.warning(
-                "rejected request path=%s status=400 reason=%s", request_path, exc
+                "rejected request path=%s status=400 reason=%s",
+                request_path,
+                exc,
             )
-            self._send_json(400, {"error": {"message": str(exc)}}, trace=trace)
-            self._finish_trace(trace, "rejected", http_status=400, reason=str(exc))
-            return
+            self._finish_trace(
+                trace, "rejected", http_status=400, reason=str(exc)
+            )
+            return web.json_response(
+                {"error": {"message": str(exc)}}, status=400
+            )
 
         if trace is not None:
             trace.record_cursor_body(payload)
@@ -154,6 +200,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
         log_cursor_request(payload, self.config)
 
+        # ── Prepare upstream request ──────────────────────────────
         prepared = prepare_upstream_request(
             payload,
             self.config,
@@ -163,6 +210,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if trace is not None:
             trace.record_transform(prepared)
         log_context_summary(prepared)
+
+        # ── Reject mode (strict) ──────────────────────────────────
         if (
             prepared.missing_reasoning_messages
             and self.config.missing_reasoning_strategy == "reject"
@@ -175,8 +224,8 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 request_path,
                 prepared.missing_reasoning_messages,
             )
-            self._send_json(
-                409,
+            self._finish_trace(trace, "rejected", http_status=409)
+            return web.json_response(
                 {
                     "error": {
                         "message": (
@@ -195,16 +244,16 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         "missing_reasoning_messages": prepared.missing_reasoning_messages,
                     }
                 },
-                trace=trace,
+                status=409,
             )
-            self._finish_trace(trace, "rejected", http_status=409)
-            return
 
+        # ── Verbose logging ───────────────────────────────────────
         if self.config.verbose:
             LOG.info(
                 (
-                    "upstream request metadata: original_model=%s upstream_model=%s "
-                    "patched_reasoning=%s missing_reasoning=%s %s"
+                    "upstream request metadata: original_model=%s "
+                    "upstream_model=%s patched_reasoning=%s "
+                    "missing_reasoning=%s %s"
                 ),
                 prepared.original_model,
                 prepared.upstream_model,
@@ -212,10 +261,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 prepared.missing_reasoning_messages,
                 summarize_chat_payload(prepared.payload),
             )
-
-        if self.config.verbose:
             log_json("upstream request body", prepared.payload)
 
+        # ── Forward to upstream ───────────────────────────────────
         upstream_body = orjson.dumps(prepared.payload)
         upstream_url = f"{self.config.upstream_base_url}/chat/completions"
         upstream_headers = self._upstream_headers(
@@ -228,337 +276,118 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 headers=upstream_headers,
                 body_bytes=upstream_body,
             )
-        request = Request(
-            upstream_url,
-            data=upstream_body,
-            method="POST",
-            headers=upstream_headers,
-        )
 
-        if self.config.verbose:
-            log_send_summary(prepared)
+        log_send_summary(prepared)
         spinner = TerminalSpinner(
-            enabled=bool(prepared.payload.get("stream")) and not self.config.verbose,
-            text="└ {frame}",
+            enabled=bool(prepared.payload.get("stream"))
+            and not self.config.verbose,
+            text="\u2514 {frame}",
         ).start()
 
         try:
-            if self.config.verbose:
-                LOG.info("forwarding to %s", upstream_url)
-            response = urlopen(request, timeout=self.config.request_timeout)
-        except HTTPError as exc:
-            spinner.stop()
-            LOG.warning(
-                "request failed upstream_status=%s stream=%s elapsed_ms=%s",
-                exc.code,
-                bool(prepared.payload.get("stream")),
-                elapsed_ms(started),
+            upstream_resp = await self._session.post(
+                upstream_url,
+                data=upstream_body,
+                headers=upstream_headers,
             )
-            self._send_upstream_error(exc, trace=trace)
-            self._finish_trace(
-                trace,
-                "upstream_error",
-                http_status=exc.code,
-                stream=bool(prepared.payload.get("stream")),
-            )
-            return
-        except URLError as exc:
+        except (OSError, asyncio.TimeoutError) as exc:
             spinner.stop()
             LOG.warning(
                 "upstream request failed elapsed_ms=%s reason=%s",
                 elapsed_ms(started),
-                exc.reason,
-            )
-            self._send_json(
-                502,
-                {"error": {"message": f"Upstream request failed: {exc.reason}"}},
-                trace=trace,
+                exc,
             )
             self._finish_trace(trace, "upstream_error", http_status=502)
-            return
-        except Exception:
+            return web.json_response(
+                {
+                    "error": {
+                        "message": f"Upstream request failed: {exc}"
+                    }
+                },
+                status=502,
+            )
+
+        upstream_status = upstream_resp.status
+        if upstream_status >= 400:
             spinner.stop()
-            raise
+            LOG.warning(
+                "request failed upstream_status=%s stream=%s elapsed_ms=%s",
+                upstream_status,
+                bool(prepared.payload.get("stream")),
+                elapsed_ms(started),
+            )
+            return await self._upstream_error_response(
+                upstream_resp, trace=trace
+            )
+
+        if self.config.verbose:
+            LOG.info(
+                "upstream response status=%s stream=%s elapsed_ms=%s",
+                upstream_status,
+                bool(prepared.payload.get("stream")),
+                elapsed_ms(started),
+            )
 
         try:
-            with response:
-                upstream_status = getattr(response, "status", 200)
-                if self.config.verbose:
-                    LOG.info(
-                        "upstream response status=%s stream=%s elapsed_ms=%s",
-                        upstream_status,
-                        bool(prepared.payload.get("stream")),
-                        elapsed_ms(started),
-                    )
-                if prepared.payload.get("stream"):
-                    sent_response = self._proxy_streaming_response(
-                        response,
-                        prepared.original_model,
-                        prepared.payload["messages"],
-                        prepared.cache_namespace,
-                        prepared.recovery_notice,
-                        trace=trace,
-                        record_response_scope=prepared.record_response_scope,
-                        record_response_messages=prepared.record_response_messages,
-                        record_response_contexts=prepared.record_response_contexts,
-                    )
-                else:
-                    sent_response = self._proxy_regular_response(
-                        response,
-                        prepared.original_model,
-                        prepared.payload["messages"],
-                        prepared.cache_namespace,
-                        prepared.recovery_notice,
-                        trace=trace,
-                        record_response_scope=prepared.record_response_scope,
-                        record_response_messages=prepared.record_response_messages,
-                        record_response_contexts=prepared.record_response_contexts,
-                    )
-                if not sent_response.sent:
-                    spinner.stop()
-                    self._finish_trace(
-                        trace,
-                        "client_disconnected",
-                        http_status=upstream_status,
-                        stream=bool(prepared.payload.get("stream")),
-                    )
-                    return
-                spinner.stop()
-                log_stats_summary(sent_response.usage)
-                self._finish_trace(
-                    trace,
-                    "completed",
-                    http_status=upstream_status,
-                    stream=bool(prepared.payload.get("stream")),
+            if prepared.payload.get("stream"):
+                response = await self._proxy_streaming_response(
+                    upstream_resp,
+                    request,
+                    prepared.original_model,
+                    prepared.payload["messages"],
+                    prepared.cache_namespace,
+                    prepared.recovery_notice,
+                    trace=trace,
+                    record_response_scope=prepared.record_response_scope,
+                    record_response_messages=prepared.record_response_messages,
+                    record_response_contexts=prepared.record_response_contexts,
                 )
+            else:
+                response = await self._proxy_regular_response(
+                    upstream_resp,
+                    prepared.original_model,
+                    prepared.payload["messages"],
+                    prepared.cache_namespace,
+                    prepared.recovery_notice,
+                    trace=trace,
+                    record_response_scope=prepared.record_response_scope,
+                    record_response_messages=prepared.record_response_messages,
+                    record_response_contexts=prepared.record_response_contexts,
+                )
+            spinner.stop()
+            log_stats_summary(
+                getattr(response, "_usage", None)
+            )
+            self._finish_trace(
+                trace,
+                "completed",
+                http_status=upstream_status,
+                stream=bool(prepared.payload.get("stream")),
+            )
+            return response
+        except (ConnectionResetError, ConnectionAbortedError):
+            spinner.stop()
+            LOG.info(
+                "client disconnected during streaming path=%s", request_path
+            )
+            self._finish_trace(
+                trace,
+                "client_disconnected",
+                http_status=upstream_status,
+                stream=bool(prepared.payload.get("stream")),
+            )
+            # Return a minimal response (the client is already gone)
+            return web.json_response(
+                {"error": {"message": "Client disconnected"}}, status=499
+            )
         finally:
             spinner.stop()
 
-    def _start_trace(self, request_path: str) -> TraceRequest | None:
-        writer = self.trace_writer
-        if writer is None:
-            return None
-        try:
-            return writer.start_request(
-                method=self.command,
-                path=request_path,
-                client_address=self.client_address[0],
-                headers={name: value for name, value in self.headers.items()},
-            )
-        except OSError as exc:
-            LOG.warning("failed to start request trace: %s", exc)
-            return None
+    # ── Regular (non-streaming) response ───────────────────────────────
 
-    def _finish_trace(
+    async def _proxy_regular_response(
         self,
-        trace: TraceRequest | None,
-        status: str,
-        **extra: Any,
-    ) -> None:
-        if trace is None:
-            return
-        try:
-            trace.finish(status, **extra)
-        except OSError as exc:
-            LOG.warning("failed to write request trace: %s", exc)
-
-    def _cursor_authorization(self) -> str | None:
-        auth_header = self.headers.get("Authorization", "")
-        scheme, separator, token = auth_header.strip().partition(" ")
-        if separator != " " or scheme.lower() != "bearer" or not token.strip():
-            return None
-        return f"Bearer {token.strip()}"
-
-    def _send_cors_headers(self) -> None:
-        if not self.config.cors:
-            return
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Origin, Content-Type, Accept, Authorization",
-        )
-        self.send_header("Access-Control-Expose-Headers", "Content-Length")
-        self.send_header("Access-Control-Allow-Credentials", "true")
-
-    def _send_json(
-        self,
-        status: int,
-        payload: dict[str, Any],
-        *,
-        trace: TraceRequest | None = None,
-    ) -> None:
-        body = orjson.dumps(payload)
-        if trace is not None:
-            trace.record_cursor_response(
-                status=status,
-                headers={
-                    "Content-Type": "application/json",
-                    "Content-Length": str(len(body)),
-                },
-                body=body,
-            )
-        sent_headers = self._send_response_headers(
-            status,
-            [
-                ("Content-Type", "application/json"),
-                ("Content-Length", str(len(body))),
-            ],
-            "sending JSON response headers",
-        )
-        if sent_headers:
-            self._write_to_client(body, "sending JSON response body")
-
-    def _send_response_headers(
-        self,
-        status: int,
-        headers: list[tuple[str, str]],
-        disconnect_context: str,
-    ) -> bool:
-        try:
-            self.send_response(status)
-            self._send_cors_headers()
-            for name, value in headers:
-                self.send_header(name, value)
-            self.end_headers()
-        except (BrokenPipeError, ConnectionError) as exc:
-            LOG.warning("client disconnected while %s: %s", disconnect_context, exc)
-            return False
-        return True
-
-    def _write_to_client(
-        self,
-        body: bytes,
-        disconnect_context: str,
-        *,
-        flush: bool = False,
-    ) -> bool:
-        try:
-            self.wfile.write(body)
-            if flush:
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionError) as exc:
-            LOG.warning("client disconnected while %s: %s", disconnect_context, exc)
-            return False
-        return True
-
-    def _send_models(self) -> None:
-        created = int(time.time())
-        model_ids = list(
-            dict.fromkeys(
-                [
-                    self.config.upstream_model,
-                    "deepseek-v4-pro",
-                    "deepseek-v4-flash",
-                ]
-            )
-        )
-        models = [
-            {
-                "id": model_id,
-                "object": "model",
-                "created": created,
-                "owned_by": "deepseek",
-            }
-            for model_id in model_ids
-        ]
-        self._send_json(200, {"object": "list", "data": models})
-
-    def _read_json_body(self) -> dict[str, Any]:
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError as exc:
-            raise ValueError("Invalid Content-Length") from exc
-        if length < 0:
-            raise ValueError("Invalid Content-Length")
-        if length > self.config.max_request_body_bytes:
-            raise RequestBodyTooLarge(
-                f"Request body is too large; limit is {self.config.max_request_body_bytes} bytes"
-            )
-        raw_body = self.rfile.read(length)
-        if not raw_body:
-            raise ValueError("Request body is empty")
-        try:
-            payload = orjson.loads(raw_body)
-        except ValueError as exc:
-            raise ValueError(f"Invalid JSON: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("Request body must be a JSON object")
-        return payload
-
-    def _record_request_body_for_trace(self, trace: TraceRequest | None) -> None:
-        if trace is None:
-            return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            trace.record_cursor_body_omitted(reason="invalid_content_length")
-            return
-        if length < 0:
-            trace.record_cursor_body_omitted(
-                reason="invalid_content_length", body_bytes=length
-            )
-            return
-        if length > self.config.max_request_body_bytes:
-            trace.record_cursor_body_omitted(reason="body_too_large", body_bytes=length)
-            self.close_connection = True
-            return
-        try:
-            raw_body = self.rfile.read(length)
-        except OSError as exc:
-            trace.record_cursor_body_omitted(
-                reason=f"read_failed:{exc}", body_bytes=length
-            )
-            return
-        trace.record_cursor_body_bytes(raw_body)
-
-    def _upstream_headers(self, stream: bool, authorization: str) -> dict[str, str]:
-        headers = {
-            "Authorization": authorization,
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream" if stream else "application/json",
-            "Accept-Encoding": "identity",
-            "User-Agent": self.server_version,
-        }
-        accept_language = self.headers.get("Accept-Language")
-        if accept_language:
-            headers["Accept-Language"] = accept_language
-        return headers
-
-    def _send_upstream_error(
-        self,
-        exc: HTTPError,
-        *,
-        trace: TraceRequest | None = None,
-    ) -> None:
-        body = read_response_body(exc)
-        if self.config.verbose:
-            log_bytes("upstream error body", body)
-        headers = {
-            "Content-Type": exc.headers.get("Content-Type", "application/json"),
-            "Content-Length": str(len(body)),
-        }
-        if trace is not None:
-            trace.record_upstream_response(
-                status=exc.code,
-                headers={name: value for name, value in exc.headers.items()},
-                body=body,
-            )
-            trace.record_cursor_response(status=exc.code, headers=headers, body=body)
-        sent_headers = self._send_response_headers(
-            exc.code,
-            [
-                ("Content-Type", headers["Content-Type"]),
-                ("Content-Length", headers["Content-Length"]),
-            ],
-            "sending upstream error headers",
-        )
-        if sent_headers:
-            self._write_to_client(body, "sending upstream error body")
-
-    def _proxy_regular_response(
-        self,
-        response: Any,
+        upstream_resp: ClientResponse,
         original_model: str,
         request_messages: list[dict[str, Any]],
         cache_namespace: str,
@@ -566,9 +395,10 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         trace: TraceRequest | None = None,
         record_response_scope: str | None = None,
         record_response_messages: list[dict[str, Any]] | None = None,
-        record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
-    ) -> ProxyResponseResult:
-        body = read_response_body(response)
+        record_response_contexts: list[tuple[str, list[dict[str, Any]]]]
+        | None = None,
+    ) -> web.Response:
+        body = await upstream_resp.read()
         upstream_body = body
         usage = usage_from_body(upstream_body)
         try:
@@ -586,7 +416,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 collapsible_reasoning=self.config.collapsible_reasoning,
             )
         except (ValueError, UnicodeDecodeError) as exc:
-            LOG.warning("failed to rewrite upstream JSON response: %s", exc)
+            LOG.warning(
+                "failed to rewrite upstream JSON response: %s", exc
+            )
 
         if self.reasoning_store is not None:
             self.reasoning_store.flush()
@@ -594,14 +426,18 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if self.config.verbose:
             log_bytes("cursor response body", body)
 
+        content_type = upstream_resp.headers.get(
+            "Content-Type", "application/json"
+        )
         headers = {
-            "Content-Type": response.headers.get("Content-Type", "application/json"),
+            "Content-Type": content_type,
             "Content-Length": str(len(body)),
         }
+
         if trace is not None:
             trace.record_upstream_response(
-                status=getattr(response, "status", 200),
-                headers=response_headers(response),
+                status=upstream_resp.status,
+                headers=response_headers(upstream_resp),
                 body=upstream_body,
                 stream=False,
             )
@@ -612,27 +448,25 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             if isinstance(upstream_payload, dict):
                 trace.record_usage(upstream_payload.get("usage"))
             trace.record_cursor_response(
-                status=getattr(response, "status", 200),
+                status=upstream_resp.status,
                 headers=headers,
                 body=body,
             )
 
-        sent_headers = self._send_response_headers(
-            getattr(response, "status", 200),
-            [
-                ("Content-Type", headers["Content-Type"]),
-                ("Content-Length", headers["Content-Length"]),
-            ],
-            "sending upstream response headers",
+        resp = web.Response(
+            status=upstream_resp.status,
+            headers=headers,
+            body=body,
         )
-        if not sent_headers:
-            return ProxyResponseResult(False, usage)
-        sent = self._write_to_client(body, "sending upstream response body")
-        return ProxyResponseResult(sent, usage)
+        resp._usage = usage  # type: ignore[attr-defined]
+        return resp
 
-    def _proxy_streaming_response(
+    # ── Streaming response ─────────────────────────────────────────────
+
+    async def _proxy_streaming_response(
         self,
-        response: Any,
+        upstream_resp: ClientResponse,
+        request: web.Request,
         original_model: str,
         request_messages: list[dict[str, Any]],
         cache_namespace: str,
@@ -640,34 +474,40 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         trace: TraceRequest | None = None,
         record_response_scope: str | None = None,
         record_response_messages: list[dict[str, Any]] | None = None,
-        record_response_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
-    ) -> ProxyResponseResult:
+        record_response_contexts: list[tuple[str, list[dict[str, Any]]]]
+        | None = None,
+    ) -> web.StreamResponse:
         if trace is not None:
             trace.record_upstream_response(
-                status=getattr(response, "status", 200),
-                headers=response_headers(response),
+                status=upstream_resp.status,
+                headers=response_headers(upstream_resp),
                 stream=True,
             )
+
+        response = web.StreamResponse(status=upstream_resp.status)
+        response.headers["Content-Type"] = "text/event-stream"
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Connection"] = "close"
+        if self.config.cors:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = (
+                "POST, GET, OPTIONS"
+            )
+            response.headers["Access-Control-Allow-Headers"] = (
+                "Origin, Content-Type, Accept, Authorization"
+            )
+            response.headers["Access-Control-Expose-Headers"] = "Content-Length"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+
+        if trace is not None:
             trace.record_cursor_response(
-                status=getattr(response, "status", 200),
+                status=upstream_resp.status,
                 headers={
-                    "Content-Type": "text/event-stream",
-                    "Cache-Control": "no-cache",
-                    "Connection": "close",
+                    str(k): str(v) for k, v in response.headers.items()
                 },
             )
-        sent_headers = self._send_response_headers(
-            getattr(response, "status", 200),
-            [
-                ("Content-Type", "text/event-stream"),
-                ("Cache-Control", "no-cache"),
-                ("Connection", "close"),
-            ],
-            "sending streaming response headers",
-        )
-        if not sent_headers:
-            return ProxyResponseResult(False)
-        self.close_connection = True
+
+        await response.prepare(request)
 
         accumulator = StreamAccumulator()
         usage: dict[str, Any] | None = None
@@ -696,10 +536,12 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         try:
             while True:
                 try:
-                    line = response.readline()
-                except (HTTPException, OSError) as exc:
-                    LOG.warning("upstream streaming response read failed: %s", exc)
-                    return ProxyResponseResult(False, usage)
+                    line = await upstream_resp.content.readline()
+                except (OSError, asyncio.TimeoutError) as exc:
+                    LOG.warning(
+                        "upstream streaming response read failed: %s", exc
+                    )
+                    break
                 if not line:
                     break
                 (
@@ -721,21 +563,22 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     usage = chunk_usage
                 if trace is not None:
                     trace.record_stream_chunk(line, rewritten)
-                if not self._write_to_client(
-                    rewritten, "sending streaming response chunk", flush=True
-                ):
-                    return ProxyResponseResult(False, usage)
+                try:
+                    await response.write(rewritten)
+                except (ConnectionResetError, ConnectionAbortedError):
+                    LOG.warning(
+                        "client disconnected while sending streaming response chunk"
+                    )
+                    return response
                 if finalized:
                     break
         finally:
-            # Store partial reasoning whenever the stream exits without
-            # the upstream's [DONE] terminator (client disconnect, upstream
-            # read failure, exception). Without this, a Stop pressed mid-stream
-            # would discard any reasoning the proxy received but never cached.
+            # Store partial reasoning when the stream exits without [DONE]
             if not finalized:
                 if self.config.verbose:
                     log_json(
-                        "model streaming assistant messages", accumulator.messages()
+                        "model streaming assistant messages",
+                        accumulator.messages(),
                     )
                 stored = sum(
                     accumulator.store_reasoning(
@@ -753,7 +596,11 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     )
             if self.reasoning_store is not None:
                 self.reasoning_store.flush()
-        return ProxyResponseResult(True, usage)
+
+        response._usage = usage  # type: ignore[attr-defined]
+        return response
+
+    # ── SSE processing (synchronous, pure logic only) ──────────────────
 
     def _rewrite_sse_line(
         self,
@@ -795,7 +642,10 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             return line, False, recovery_notice, None
 
         if isinstance(chunk, dict):
-            if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
+            if (
+                recovery_notice
+                and inject_recovery_notice(chunk, recovery_notice)
+            ):
                 recovery_notice = None
             accumulator.ingest_chunk(chunk)
             stored = sum(
@@ -808,7 +658,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 for scope, prior_messages in response_contexts
             )
             if self.config.verbose and stored:
-                LOG.info("stored %s streaming reasoning cache key(s)", stored)
+                LOG.info(
+                    "stored %s streaming reasoning cache key(s)", stored
+                )
             chunk_usage = chunk.get("usage")
             if trace is not None:
                 trace.record_usage(chunk_usage)
@@ -818,11 +670,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 chunk["model"] = original_model
             ending = b"\r\n" if line.endswith(b"\r\n") else b"\n"
             return (
-                (
-                    b"data: "
-                    + orjson.dumps(chunk)
-                    + ending
-                ),
+                b"data: " + orjson.dumps(chunk) + ending,
                 False,
                 recovery_notice,
                 chunk_usage if isinstance(chunk_usage, dict) else None,
@@ -839,7 +687,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         recovery_notice: str | None,
     ) -> tuple[bytes, bool, str | None, dict[str, Any] | None]:
         if self.config.verbose:
-            log_json("model streaming assistant messages", accumulator.messages())
+            log_json(
+                "model streaming assistant messages", accumulator.messages()
+            )
         stored = sum(
             accumulator.store_reasoning(
                 self.reasoning_store,
@@ -850,7 +700,9 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             for scope, prior_messages in response_contexts
         )
         if self.config.verbose and stored:
-            LOG.info("stored %s streaming reasoning cache key(s)", stored)
+            LOG.info(
+                "stored %s streaming reasoning cache key(s)", stored
+            )
         prefix = b""
         if display_adapter is None:
             if recovery_notice:
@@ -867,16 +719,209 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             )
         return prefix + b"data: [DONE]\n\n", True, None, None
 
+    # ── Trace helpers ──────────────────────────────────────────────────
+
+    def _start_trace(
+        self, request_path: str, request: web.Request
+    ) -> TraceRequest | None:
+        writer = self.trace_writer
+        if writer is None:
+            return None
+        try:
+            return writer.start_request(
+                method=request.method,
+                path=request_path,
+                client_address=request.remote or "",
+                headers={
+                    str(name): str(value)
+                    for name, value in request.headers.items()
+                },
+            )
+        except OSError as exc:
+            LOG.warning("failed to start request trace: %s", exc)
+            return None
+
+    def _finish_trace(
+        self,
+        trace: TraceRequest | None,
+        status: str,
+        **extra: Any,
+    ) -> None:
+        if trace is None:
+            return
+        try:
+            trace.finish(status, **extra)
+        except Exception as exc:
+            LOG.warning("failed to write request trace: %s", exc)
+
+    # ── Upstream helpers ───────────────────────────────────────────────
+
+    def _cursor_authorization(
+        self, request: web.Request
+    ) -> str | None:
+        auth_header = request.headers.get("Authorization", "")
+        scheme, separator, token = auth_header.strip().partition(" ")
+        if (
+            separator != " "
+            or scheme.lower() != "bearer"
+            or not token.strip()
+        ):
+            return None
+        return f"Bearer {token.strip()}"
+
+    def _upstream_headers(
+        self, stream: bool, authorization: str
+    ) -> dict[str, str]:
+        return {
+            "Authorization": authorization,
+            "Content-Type": "application/json",
+            "Accept": (
+                "text/event-stream" if stream else "application/json"
+            ),
+            "Accept-Encoding": "identity",
+            "User-Agent": SERVER_VERSION,
+        }
+
+    async def _upstream_error_response(
+        self,
+        upstream_resp: ClientResponse,
+        *,
+        trace: TraceRequest | None = None,
+    ) -> web.Response:
+        body = await upstream_resp.read()
+        if self.config.verbose:
+            log_bytes("upstream error body", body)
+        content_type = upstream_resp.headers.get(
+            "Content-Type", "application/json"
+        )
+        headers = {
+            "Content-Type": content_type,
+            "Content-Length": str(len(body)),
+        }
+        if trace is not None:
+            trace.record_upstream_response(
+                status=upstream_resp.status,
+                headers=response_headers(upstream_resp),
+                body=body,
+            )
+            trace.record_cursor_response(
+                status=upstream_resp.status, headers=headers, body=body
+            )
+        return web.Response(
+            status=upstream_resp.status, headers=headers, body=body
+        )
+
+    async def _read_json_body(
+        self, request: web.Request
+    ) -> dict[str, Any]:
+        try:
+            length = int(request.headers.get("Content-Length") or 0)
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length") from exc
+        if length < 0:
+            raise ValueError("Invalid Content-Length")
+        if length > self.config.max_request_body_bytes:
+            raise RequestBodyTooLarge(
+                f"Request body is too large; limit is "
+                f"{self.config.max_request_body_bytes} bytes"
+            )
+        raw_body = await request.read()
+        if not raw_body:
+            raise ValueError("Request body is empty")
+        try:
+            payload = orjson.loads(raw_body)
+        except ValueError as exc:
+            raise ValueError(f"Invalid JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Request body must be a JSON object")
+        return payload
+
+    async def _record_request_body_for_trace(
+        self, request: web.Request, trace: TraceRequest | None
+    ) -> None:
+        if trace is None:
+            return
+        try:
+            length = int(request.headers.get("Content-Length") or 0)
+        except ValueError:
+            trace.record_cursor_body_omitted(
+                reason="invalid_content_length"
+            )
+            return
+        if length < 0:
+            trace.record_cursor_body_omitted(
+                reason="invalid_content_length", body_bytes=length
+            )
+            return
+        if length > self.config.max_request_body_bytes:
+            trace.record_cursor_body_omitted(
+                reason="body_too_large", body_bytes=length
+            )
+            return
+        try:
+            raw_body = await request.read()
+        except OSError as exc:
+            trace.record_cursor_body_omitted(
+                reason=f"read_failed:{exc}", body_bytes=length
+            )
+            return
+        trace.record_cursor_body_bytes(raw_body)
+
+
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
+
+
+def create_app(
+    config: ProxyConfig,
+    reasoning_store: ReasoningStore,
+    trace_writer: TraceWriter | None = None,
+) -> web.Application:
+    """Build and return a configured aiohttp ``Application``."""
+    handler = DeepSeekProxyHandler(config, reasoning_store, trace_writer)
+    app = web.Application()
+    app._handler = handler
+
+    async def on_startup(app: web.Application) -> None:
+        await handler.start()
+
+    async def on_shutdown(app: web.Application) -> None:
+        await handler.stop()
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    app.router.add_get("/healthz", handler.healthz)
+    app.router.add_get("/v1/healthz", handler.healthz)
+    app.router.add_get("/models", handler.models)
+    app.router.add_get("/v1/models", handler.models)
+    app.router.add_post("/chat/completions", handler.chat_completions)
+    app.router.add_post(
+        "/v1/chat/completions", handler.chat_completions
+    )
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# CLI argument parser
+# ---------------------------------------------------------------------------
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the local DeepSeek Cursor proxy")
+    parser = argparse.ArgumentParser(
+        description="Run the local DeepSeek Cursor proxy"
+    )
     parser.add_argument(
         "--config",
         dest="config_path",
         type=Path,
         help=f"YAML config file, default {default_config_path()}",
     )
-    parser.add_argument("--host", help="Bind host, default from config or 127.0.0.1")
+    parser.add_argument(
+        "--host", help="Bind host, default from config or 127.0.0.1"
+    )
     parser.add_argument(
         "--port",
         type=int,
@@ -891,7 +936,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--base-url",
-        help=("DeepSeek base URL, default from config or https://api.deepseek.com"),
+        help=(
+            "DeepSeek base URL, "
+            "default from config or https://api.deepseek.com"
+        ),
     )
     parser.add_argument(
         "--thinking",
@@ -946,7 +994,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--collapsible-reasoning",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Use Markdown details for mirrored reasoning when display is enabled",
+        help=(
+            "Use Markdown details for mirrored reasoning "
+            "when display is enabled"
+        ),
     )
     parser.add_argument(
         "--collasible-reasoning",
@@ -1006,6 +1057,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# ---------------------------------------------------------------------------
+# Pure helpers (sync, no I/O)
+# ---------------------------------------------------------------------------
+
+
 def elapsed_ms(started: float) -> int:
     return round((time.monotonic() - started) * 1000)
 
@@ -1014,7 +1070,10 @@ def log_json(label: str, payload: Any) -> None:
     LOG.info(
         "%s:\n%s",
         label,
-        orjson.dumps(payload, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode("utf-8"),
+        orjson.dumps(
+            payload,
+            option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
+        ).decode("utf-8"),
     )
 
 
@@ -1022,7 +1081,9 @@ def log_bytes(label: str, body: bytes) -> None:
     try:
         payload = orjson.loads(body)
     except (ValueError, UnicodeDecodeError):
-        LOG.info("%s:\n%s", label, body.decode("utf-8", errors="replace"))
+        LOG.info(
+            "%s:\n%s", label, body.decode("utf-8", errors="replace")
+        )
         return
     log_json(label, payload)
 
@@ -1045,7 +1106,7 @@ def log_cursor_request(
 ) -> None:
     model = str(payload.get("model") or config.upstream_model)
     LOG.info(
-        "┌ request model=%s effort=%s messages=%s",
+        "\u250c request model=%s effort=%s messages=%s",
         model,
         config.reasoning_effort,
         format_count(message_count(payload)),
@@ -1056,12 +1117,12 @@ def log_context_summary(prepared: Any) -> None:
     status = context_status(prepared)
     if status == "ok":
         LOG.info(
-            "├ context status=ok reasoning_context=%s",
+            "\u251c context status=ok reasoning_context=%s",
             format_count(prepared.patched_reasoning_messages),
         )
         return
     LOG.info(
-        "├ context status=%s missing=%s recovered=%s dropped=%s",
+        "\u251c context status=%s missing=%s recovered=%s dropped=%s",
         status,
         format_count(prepared.missing_reasoning_messages),
         format_count(prepared.recovered_reasoning_messages),
@@ -1071,7 +1132,8 @@ def log_context_summary(prepared: Any) -> None:
 
 def log_send_summary(prepared: Any) -> None:
     LOG.info(
-        "├ send    user_msgs=%s messages=%s tools=%s reasoning_content=%s",
+        "\u251c send    user_msgs=%s messages=%s tools=%s "
+        "reasoning_content=%s",
         format_count(user_message_count(prepared.payload)),
         format_count(message_count(prepared.payload)),
         format_count(tool_count(prepared.payload)),
@@ -1081,7 +1143,7 @@ def log_send_summary(prepared: Any) -> None:
 
 def log_stats_summary(usage: dict[str, Any] | None) -> None:
     LOG.info(
-        "└ stats   prompt=%s output=%s reasoning=%s cache_hit=%s",
+        "\u2514 stats   prompt=%s output=%s reasoning=%s cache_hit=%s",
         format_usage_count(usage, "prompt_tokens"),
         format_usage_count(usage, "completion_tokens"),
         format_count(reasoning_token_count(usage)),
@@ -1131,7 +1193,9 @@ def reasoning_content_count(payload: dict[str, Any]) -> int:
     )
 
 
-def format_usage_count(usage: dict[str, Any] | None, key: str) -> str:
+def format_usage_count(
+    usage: dict[str, Any] | None, key: str
+) -> str:
     if not isinstance(usage, dict):
         return "?"
     return format_count(usage.get(key))
@@ -1181,7 +1245,9 @@ def sse_data(payload: dict[str, Any]) -> bytes:
     return b"data: " + orjson.dumps(payload) + b"\n\n"
 
 
-def inject_recovery_notice(chunk: dict[str, Any], notice: str) -> bool:
+def inject_recovery_notice(
+    chunk: dict[str, Any], notice: str
+) -> bool:
     choices = chunk.get("choices")
     if not isinstance(choices, list):
         return False
@@ -1234,12 +1300,27 @@ def summarize_chat_payload(payload: dict[str, Any]) -> str:
     )
 
 
-def read_response_body(response: Any) -> bytes:
+def read_response_body(
+    response: Any,
+    encoding: str | None = None,
+) -> bytes:
+    """Read body from a response-like object and decompress if needed.
+
+    ``encoding`` can be passed explicitly (e.g. from aiohttp response
+    headers).  If omitted the function falls back to
+    ``response.headers["Content-Encoding"]`` (urllib style).
+    """
     body = response.read()
-    encoding = (response.headers.get("Content-Encoding") or "").lower()
-    if encoding == "gzip":
+    if encoding is None:
+        headers = getattr(response, "headers", {})
+        if hasattr(headers, "get"):
+            encoding = (headers.get("Content-Encoding") or "").lower()
+        else:
+            encoding = ""
+    enc = (encoding or "").lower()
+    if enc == "gzip":
         return gzip.decompress(body)
-    if encoding == "deflate":
+    if enc == "deflate":
         try:
             return zlib.decompress(body)
         except zlib.error:
@@ -1248,6 +1329,7 @@ def read_response_body(response: Any) -> bytes:
 
 
 def response_headers(response: Any) -> dict[str, str]:
+    """Extract headers dict from a response-like object."""
     headers = getattr(response, "headers", {})
     if hasattr(headers, "items"):
         return {str(name): str(value) for name, value in headers.items()}
@@ -1261,17 +1343,27 @@ def warn_if_insecure_upstream(url: str) -> None:
     host = parsed.hostname or ""
     if host in {"127.0.0.1", "localhost", "::1"}:
         return
-    LOG.warning("upstream base_url uses plain HTTP; bearer tokens may be exposed")
+    LOG.warning(
+        "upstream base_url uses plain HTTP; bearer tokens may be exposed"
+    )
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def build_config_from_args(
+    args: argparse.Namespace,
+) -> tuple[ProxyConfig, ReasoningStore, TraceWriter | None]:
+    """Parse CLI args and wire up config, reasoning store and trace writer."""
     try:
         config = ProxyConfig.from_file(config_path=args.config_path)
     except ValueError as exc:
         configure_logging(verbose=bool(args.verbose))
         LOG.error("%s", exc)
-        return 2
+        raise SystemExit(2) from exc
+
     updates: dict[str, Any] = {}
     if args.host is not None:
         updates["host"] = args.host
@@ -1313,22 +1405,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.reasoning_cache_max_rows is not None:
         updates["reasoning_cache_max_rows"] = args.reasoning_cache_max_rows
     if args.missing_reasoning_strategy is not None:
-        updates["missing_reasoning_strategy"] = args.missing_reasoning_strategy
+        updates["missing_reasoning_strategy"] = (
+            args.missing_reasoning_strategy
+        )
     if updates:
         config = replace(config, **updates)
 
     configure_logging(verbose=config.verbose)
     warn_if_insecure_upstream(config.upstream_base_url)
+
     store = ReasoningStore(
         config.reasoning_content_path,
         max_age_seconds=config.reasoning_cache_max_age_seconds,
         max_rows=config.reasoning_cache_max_rows,
     )
-    if args.clear_reasoning_cache:
-        deleted = store.clear()
-        LOG.info("cleared %s reasoning cache row(s)", deleted)
-        store.close()
-        return 0
+
     trace_writer: TraceWriter | None = None
     if config.trace_dir is not None:
         try:
@@ -1336,11 +1427,22 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             LOG.error("failed to initialize trace directory: %s", exc)
             store.close()
-            return 2
-    server = DeepSeekProxyServer((config.host, config.port), DeepSeekProxyHandler)
-    server.config = config
-    server.reasoning_store = store
-    server.trace_writer = trace_writer
+            raise SystemExit(2) from exc
+
+    return config, store, trace_writer
+
+
+async def async_main(args: argparse.Namespace) -> int:
+    """Async entry point: start the aiohttp server and run until interrupt."""
+    config, store, trace_writer = build_config_from_args(args)
+
+    if args.clear_reasoning_cache:
+        deleted = store.clear()
+        LOG.info("cleared %s reasoning cache row(s)", deleted)
+        store.close()
+        return 0
+
+    app = create_app(config, store, trace_writer)
 
     tunnel: NgrokTunnel | None = None
     public_url: str | None = None
@@ -1351,12 +1453,14 @@ def main(argv: list[str] | None = None) -> int:
             public_url = tunnel.start()
         except RuntimeError as exc:
             LOG.error("%s", exc)
-            server.server_close()
             store.close()
             return 2
+
     local_base_url = f"http://{config.host}:{config.port}/v1"
     api_base_url = (
-        f"{public_url.rstrip('/')}/v1" if public_url is not None else local_base_url
+        f"{public_url.rstrip('/')}/v1"
+        if public_url is not None
+        else local_base_url
     )
 
     LOG.info(
@@ -1370,33 +1474,67 @@ def main(argv: list[str] | None = None) -> int:
         display_reasoning = "off"
         if config.display_reasoning:
             display_reasoning = (
-                "on (collapsible)" if config.collapsible_reasoning else "on"
+                "on (collapsible)"
+                if config.collapsible_reasoning
+                else "on"
             )
         LOG.info("display_reasoning: %s", display_reasoning)
-        LOG.info("missing_reasoning_strategy: %s", config.missing_reasoning_strategy)
+        LOG.info(
+            "missing_reasoning_strategy: %s",
+            config.missing_reasoning_strategy,
+        )
         LOG.info("reasoning_cache: %s", config.reasoning_content_path)
         LOG.warning(
-            "verbose logging enabled; prompts and code may be written to stdout"
+            "verbose logging enabled; "
+            "prompts and code may be written to stdout"
         )
     if trace_writer is not None:
         LOG.info("trace_dir: %s", trace_writer.session_dir)
-        LOG.warning("trace logging enabled; prompts and code will be written to disk")
+        LOG.warning(
+            "trace logging enabled; "
+            "prompts and code will be written to disk"
+        )
     if public_url is None and not config.ngrok:
         LOG.info("public_tunnel: off")
     if config.verbose:
-        LOG.info("upstream_url: %s/chat/completions", config.upstream_base_url)
+        LOG.info(
+            "upstream_url: %s/chat/completions",
+            config.upstream_base_url,
+        )
     LOG.info("local_base_url: %s", local_base_url)
     LOG.info("api_base_url: %s", api_base_url)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, config.host, config.port)
     try:
-        server.serve_forever()
+        await site.start()
+        LOG.info(
+            "listening on http://%s:%s", config.host, config.port
+        )
+        # Sleep forever until interrupted
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
     except KeyboardInterrupt:
         LOG.info("shutting down")
     finally:
+        await runner.cleanup()
         if tunnel is not None:
             tunnel.stop()
-        server.server_close()
         store.close()
+
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Synchronous entry point (wraps async_main)."""
+    args = build_arg_parser().parse_args(argv)
+    try:
+        return asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        return 0
 
 
 if __name__ == "__main__":
