@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import dataclass, replace
 import gzip
 import orjson
+import os
 from pathlib import Path
 import sys
 import time
@@ -775,6 +776,9 @@ class DeepSeekProxyHandler:
     def _cursor_authorization(
         self, request: web.Request
     ) -> str | None:
+        deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if deepseek_api_key:
+            return f"Bearer {deepseek_api_key.strip()}"
         auth_header = request.headers.get("Authorization", "")
         scheme, separator, token = auth_header.strip().partition(" ")
         if (

@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  deepseek-cursor-proxy-async:
+    build: .
+    container_name: deepseek-cursor-proxy-async
+    restart: unless-stopped
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+    ports:
+      - "${DEEPSEEK_PROXY_IP:-127.0.0.1}:${DEEPSEEK_PROXY_PORT:-9088}:9000"
