@@ -880,7 +880,8 @@ def create_app(
 ) -> web.Application:
     """Build and return a configured aiohttp ``Application``."""
     handler = DeepSeekProxyHandler(config, reasoning_store, trace_writer)
-    app = web.Application()
+    # aiohttp defaults client_max_size to 1 MiB; align with our config (20 MiB).
+    app = web.Application(client_max_size=config.max_request_body_bytes)
     app._handler = handler
 
     async def on_startup(app: web.Application) -> None:

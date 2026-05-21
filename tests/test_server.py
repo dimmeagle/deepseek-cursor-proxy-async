@@ -158,6 +158,21 @@ class CliAndHelperTests(unittest.TestCase):
         )
         self.assertEqual(args.ngrok_url, "https://example.ngrok.app")
 
+    def test_create_app_client_max_size_matches_config(self) -> None:
+        store = ReasoningStore(":memory:")
+        try:
+            config = replace(
+                ProxyConfig(
+                    upstream_base_url="http://127.0.0.1:1",
+                    upstream_model="deepseek-v4-pro",
+                ),
+                max_request_body_bytes=42_000_000,
+            )
+            app = create_app(config, store)
+            self.assertEqual(app._client_max_size, 42_000_000)
+        finally:
+            store.close()
+
     def test_default_console_logging_hides_info_prefix_and_timestamp(
         self,
     ) -> None:
