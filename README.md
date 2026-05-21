@@ -65,6 +65,10 @@ pip install -e .
 deepseek-cursor-proxy
 ```
 
+> **API key resolution:** The proxy resolves the upstream DeepSeek API key in the following order:
+> 1. **`DEEPSEEK_API_KEY` environment variable** — if set, this key is used for **all** upstream requests regardless of what the client sends. Useful for shared proxy deployments.
+> 2. **Incoming `Authorization` header** — if `DEEPSEEK_API_KEY` is not set, the proxy forwards each client's API key as-is. This allows multiple clients to use their own DeepSeek keys through a single proxy instance.
+
 ## Docker Setup
 
 ```bash
