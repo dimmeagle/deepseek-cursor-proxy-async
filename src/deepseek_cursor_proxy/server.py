@@ -383,6 +383,22 @@ class DeepSeekProxyHandler:
         finally:
             spinner.stop()
 
+    # ── Catch-all for unsupported POST paths ───────────────────────────
+
+    async def unsupported_post_path(
+        self, request: web.Request
+    ) -> web.StreamResponse | web.Response:
+        """Handle POST requests to paths other than /chat/completions.
+        aiohttp's router would otherwise return 404 before reaching this
+        handler, preventing trace writers from capturing the request."""
+        trace = self._start_trace(request.path, request)
+        await self._record_request_body_for_trace(request, trace)
+        self._finish_trace(trace, "rejected", http_status=404)
+        return web.json_response(
+            {"error": {"message": "Only /v1/chat/completions is supported"}},
+            status=404,
+        )
+
     # ── Regular (non-streaming) response ───────────────────────────────
 
     async def _proxy_regular_response(
@@ -900,6 +916,11 @@ def create_app(
     app.router.add_post("/chat/completions", handler.chat_completions)
     app.router.add_post(
         "/v1/chat/completions", handler.chat_completions
+    )
+    # Catch-all POST for unsupported paths — ensures traces are written
+    # instead of being swallowed by aiohttp's built-in 404 handler.
+    app.router.add_post(
+        "/{tail:.*}", handler.unsupported_post_path
     )
 
     return app

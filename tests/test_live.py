@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 import json
 import os
+import sys
 import threading
 import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from aiohttp import web
+
 from deepseek_cursor_proxy.config import ProxyConfig
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
-from deepseek_cursor_proxy.server import DeepSeekProxyHandler, DeepSeekProxyServer
+from deepseek_cursor_proxy.server import create_app
 
 
 LIVE_DEEPSEEK = os.getenv("RUN_LIVE_DEEPSEEK_TESTS") == "1" and bool(
@@ -41,29 +45,44 @@ def post_json(
 class ProxyFixture:
     def __init__(self) -> None:
         self.store = ReasoningStore(":memory:")
-        server = DeepSeekProxyServer(("127.0.0.1", 0), DeepSeekProxyHandler)
-        server.config = ProxyConfig(
+        self.config = ProxyConfig(
             upstream_base_url="https://api.deepseek.com",
             upstream_model="deepseek-v4-pro",
             request_timeout=180,
         )
-        server.reasoning_store = self.store
-        self.server = server
-        self.thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self._started = threading.Event()
+        self._port_holder: list[int] = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._started.wait(timeout=10)
+
+    def _run(self) -> None:
+        if sys.platform == "win32":
+            loop = asyncio.SelectorEventLoop()
+        else:
+            loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._start())
+
+    async def _start(self) -> None:
+        app = create_app(self.config, self.store)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        sock = site._server.sockets[0]
+        self._port_holder.append(sock.getsockname()[1])
+        self._started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await runner.cleanup()
 
     @property
     def url(self) -> str:
-        host, port = self.server.server_address
-        return f"http://{host}:{port}/v1/chat/completions"
-
-    def start(self) -> "ProxyFixture":
-        self.thread.start()
-        return self
+        return f"http://127.0.0.1:{self._port_holder[0]}/v1/chat/completions"
 
     def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
         self.store.close()
 
 
@@ -74,7 +93,7 @@ class ProxyFixture:
 class LiveDeepSeekProxyTests(unittest.TestCase):
     def test_proxy_repairs_real_deepseek_tool_call_history(self) -> None:
         api_key = os.environ["LIVE_DEEPSEEK_KEY"]
-        proxy = ProxyFixture().start()
+        proxy = ProxyFixture()
         try:
             first_status, first_response = post_json(
                 proxy.url,
