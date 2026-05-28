@@ -809,6 +809,21 @@ class DeepSeekProxyHandler:
         trace: TraceRequest | None = None,
     ) -> web.Response:
         body = await upstream_resp.read()
+        # Always log a summary of 4xx errors (client errors are often
+        # actionable and the body contains the upstream error message).
+        try:
+            error_obj = orjson.loads(body)
+            error_msg = (
+                error_obj.get("error", {}).get("message", "")
+                or error_obj.get("error", "")
+            )
+            if error_msg:
+                LOG.warning(
+                    "upstream error body: %s",
+                    str(error_msg)[:300],
+                )
+        except Exception:
+            log_bytes("upstream error body", body)
         if self.config.verbose:
             log_bytes("upstream error body", body)
         content_type = upstream_resp.headers.get(

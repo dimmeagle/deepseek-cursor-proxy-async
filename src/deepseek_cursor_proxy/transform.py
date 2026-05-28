@@ -46,6 +46,7 @@ SUPPORTED_REQUEST_FIELDS = {
     "seed",
     "n",
     "logit_bias",
+    "parallel_tool_calls",
 }
 
 MESSAGE_FIELDS = {

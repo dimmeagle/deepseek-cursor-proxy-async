@@ -161,16 +161,16 @@ class RequestPreparationTests(unittest.TestCase):
                 {
                     "model": "deepseek-v4-pro",
                     "messages": [{"role": "user", "content": "hi"}],
-                    "parallel_tool_calls": True,
+                    "custom_client_field": "ignored",
                     "service_tier": "fast",
                 },
                 ProxyConfig(),
                 self.store,
             )
-        self.assertNotIn("parallel_tool_calls", prepared.payload)
+        self.assertNotIn("custom_client_field", prepared.payload)
         self.assertNotIn("service_tier", prepared.payload)
         log = "\n".join(captured.output)
-        self.assertIn("parallel_tool_calls", log)
+        self.assertIn("custom_client_field", log)
         self.assertIn("service_tier", log)
 
     def test_non_deepseek_model_is_rewritten_with_warning(self) -> None:
