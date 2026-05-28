@@ -309,6 +309,13 @@ def normalize_message(
     if normalized["role"] == "assistant" and isinstance(normalized.get("content"), str):
         normalized["content"] = strip_cursor_thinking_blocks(normalized["content"])
 
+    if (
+        normalized["role"] == "assistant"
+        and normalized.get("tool_calls")
+        and not normalized.get("content")
+    ):
+        normalized["content"] = None
+
     if normalized.get("tool_calls"):
         normalized["tool_calls"] = [
             normalize_tool_call(tool_call)

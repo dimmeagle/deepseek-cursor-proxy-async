@@ -270,9 +270,7 @@ class DeepSeekProxyHandler:
 
         # ── Forward to upstream ───────────────────────────────────
         self._validate_message_ids(prepared.payload)
-        upstream_body = orjson.dumps(
-            prepared.payload, option=orjson.OPT_SORT_KEYS
-        )
+        upstream_body = orjson.dumps(prepared.payload)
         upstream_url = f"{self.config.upstream_base_url}/chat/completions"
         upstream_headers = self._upstream_headers(
             stream=bool(prepared.payload.get("stream")),

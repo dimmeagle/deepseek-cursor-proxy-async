@@ -85,7 +85,10 @@ def canonical_scope_message(message: dict[str, Any]) -> dict[str, Any]:
     canonical: dict[str, Any] = {"role": message.get("role")}
     for key in ("content", "name", "tool_call_id", "prefix"):
         if key in message:
-            canonical[key] = message[key]
+            value = message[key]
+            if key == "content" and value is None:
+                value = ""
+            canonical[key] = value
     if message.get("tool_calls"):
         canonical["tool_calls"] = [
             normalize_tool_call(tool_call)
