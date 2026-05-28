@@ -50,6 +50,7 @@ SUPPORTED_REQUEST_FIELDS = {
 }
 
 MESSAGE_FIELDS = {
+    "id",
     "role",
     "content",
     "name",
@@ -60,9 +61,10 @@ MESSAGE_FIELDS = {
 }
 
 ROLE_MESSAGE_FIELDS = {
-    "system": {"role", "content", "name"},
-    "user": {"role", "content", "name"},
+    "system": {"id", "role", "content", "name"},
+    "user": {"id", "role", "content", "name"},
     "assistant": {
+        "id",
         "role",
         "content",
         "name",
@@ -70,7 +72,7 @@ ROLE_MESSAGE_FIELDS = {
         "reasoning_content",
         "prefix",
     },
-    "tool": {"role", "content", "tool_call_id"},
+    "tool": {"id", "role", "content", "tool_call_id"},
 }
 
 EFFORT_ALIASES = {
