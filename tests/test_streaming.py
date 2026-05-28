@@ -7,6 +7,7 @@ from deepseek_cursor_proxy.streaming import (
     CursorReasoningDisplayAdapter,
     StreamAccumulator,
     fold_reasoning_into_content,
+    strip_tool_tags,
 )
 
 
@@ -468,6 +469,66 @@ class FoldReasoningTests(unittest.TestCase):
         }
         fold_reasoning_into_content(payload, collapsible=True)
         self.assertEqual(payload["choices"][0]["message"]["content"], "answer")
+
+
+class StripToolTagsTests(unittest.TestCase):
+    def test_removes_tool_comment_block(self) -> None:
+        text = "before <tool_comment>\nsome comment\n</tool_comment> after"
+        self.assertEqual(strip_tool_tags(text), "before  after")
+
+    def test_removes_tool_use_block(self) -> None:
+        text = "prefix <tool_use>\n{\"name\": \"read\"}\n</tool_use> suffix"
+        self.assertEqual(strip_tool_tags(text), "prefix  suffix")
+
+    def test_removes_multiple_blocks(self) -> None:
+        text = (
+            "start "
+            "<tool_comment>note</tool_comment> "
+            "middle "
+            "<tool_use>action</tool_use> "
+            "end"
+        )
+        self.assertEqual(strip_tool_tags(text), "start  middle  end")
+
+    def test_removes_block_with_attributes(self) -> None:
+        text = '<tool_comment type="info">attr test</tool_comment>'
+        self.assertEqual(strip_tool_tags(text), "")
+
+    def test_case_insensitive(self) -> None:
+        text = "<TOOL_COMMENT>CAPS</TOOL_COMMENT> <Tool_Use>Mixed</Tool_Use>"
+        self.assertEqual(strip_tool_tags(text), " ")
+
+    def test_nested_strips_first_complete_pair(self) -> None:
+        # Non-greedy regex matches from first <tool_comment> to first
+        # </tool_comment>, leaving the unpaired outer closing tag.
+        text = (
+            "<tool_comment>"
+            "outer <tool_comment>inner</tool_comment>"
+            "</tool_comment>"
+        )
+        # Removes: <tool_comment>outer <tool_comment>inner</tool_comment>
+        self.assertEqual(strip_tool_tags(text), "</tool_comment>")
+
+    def test_preserves_normal_text(self) -> None:
+        text = "regular text without any tags"
+        self.assertEqual(strip_tool_tags(text), text)
+
+    def test_empty_string(self) -> None:
+        self.assertEqual(strip_tool_tags(""), "")
+
+    def test_only_partial_tag_left_intact(self) -> None:
+        text = "<tool_comment>unclosed"
+        self.assertEqual(strip_tool_tags(text), text)
+
+    def test_multiline_block(self) -> None:
+        text = (
+            "<tool_comment>\n"
+            "line 1\n"
+            "line 2\n"
+            "</tool_comment>\n"
+            "visible"
+        )
+        self.assertEqual(strip_tool_tags(text), "\nvisible")
 
 
 if __name__ == "__main__":

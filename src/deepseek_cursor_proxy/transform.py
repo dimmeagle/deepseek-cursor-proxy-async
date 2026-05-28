@@ -109,11 +109,13 @@ RECOVERY_SYSTEM_CONTENT = (
 
 
 def ensure_message_id(message: dict[str, Any], index: int | None = None) -> dict[str, Any]:
-    """Ensure the message dict has an ``id`` field for upstream DeepSeek API
-    compatibility. DeepSeek v4 requires every message in the ``messages``
-    array to carry an ``id``. If the client didn't supply one or the proxy
-    synthesised the message, inject a stable proxy-generated identifier."""
-    if "id" not in message:
+    """Ensure the message dict has a **non-empty** ``id`` field for upstream
+    DeepSeek API compatibility. DeepSeek v4 requires every message in the
+    ``messages`` array to carry an ``id``. If the client didn't supply one,
+    supplied an empty / null value, or the proxy synthesised the message,
+    inject a stable proxy-generated identifier."""
+    existing = message.get("id")
+    if not isinstance(existing, str) or not existing.strip():
         if index is not None:
             message["id"] = f"proxy-msg-{index}"
         else:

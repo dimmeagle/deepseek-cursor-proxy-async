@@ -34,7 +34,11 @@ from .logging import (
     configure_logging,
 )
 from .reasoning_store import ReasoningStore, conversation_scope
-from .streaming import CursorReasoningDisplayAdapter, StreamAccumulator
+from .streaming import (
+    CursorReasoningDisplayAdapter,
+    StreamAccumulator,
+    strip_tool_tags,
+)
 from .trace import TraceRequest, TraceWriter
 from .tunnel import NgrokTunnel, local_tunnel_target
 from .transform import (
@@ -265,6 +269,7 @@ class DeepSeekProxyHandler:
             log_json("upstream request body", prepared.payload)
 
         # ── Forward to upstream ───────────────────────────────────
+        self._validate_message_ids(prepared.payload)
         upstream_body = orjson.dumps(prepared.payload)
         upstream_url = f"{self.config.upstream_base_url}/chat/completions"
         upstream_headers = self._upstream_headers(
@@ -316,6 +321,12 @@ class DeepSeekProxyHandler:
                 upstream_status,
                 bool(prepared.payload.get("stream")),
                 elapsed_ms(started),
+            )
+            # Log the request that triggered the error so the operator can
+            # inspect which messages / fields are problematic.
+            self._log_failed_upstream_request(
+                prepared.payload, upstream_status,
+                verbose=self.config.verbose,
             )
             return await self._upstream_error_response(
                 upstream_resp, trace=trace
@@ -659,6 +670,11 @@ class DeepSeekProxyHandler:
             return line, False, recovery_notice, None
 
         if isinstance(chunk, dict):
+            # Strip tool tags from visible content deltas so DeepSeek's
+            # internal <tool_comment> / <tool_use> artefacts never reach
+            # the client (Continue / Cursor).  reasoning_content is left
+            # intact — it may be needed for the caching layer.
+            _clean_chunk_content_deltas(chunk)
             if (
                 recovery_notice
                 and inject_recovery_notice(chunk, recovery_notice)
@@ -801,6 +817,74 @@ class DeepSeekProxyHandler:
             "Accept-Encoding": "identity",
             "User-Agent": SERVER_VERSION,
         }
+
+    @staticmethod
+    def _validate_message_ids(payload: dict[str, Any]) -> None:
+        """Verify every message in *payload* has an ``id`` field before the
+        request leaves for the upstream API.  Log a warning for any message
+        that is missing one so the operator can catch regressions early."""
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return
+        missing: list[int] = []
+        for i, msg in enumerate(messages):
+            if isinstance(msg, dict) and "id" not in msg:
+                missing.append(i)
+        if missing:
+            LOG.warning(
+                "messages missing 'id' field (indices: %s) — upstream will "
+                "likely reject this request with a 400 deserialization error",
+                missing,
+            )
+
+    @staticmethod
+    def _log_failed_upstream_request(
+        payload: dict[str, Any], status: int, *, verbose: bool = False
+    ) -> None:
+        """Log a compact summary of the request that triggered an upstream
+        error so the operator can spot missing fields, malformed messages,
+        or other issues without needing ``--verbose``."""
+        model = payload.get("model", "?")
+        stream = bool(payload.get("stream"))
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            LOG.warning(
+                "failed request: model=%s stream=%s status=%s messages=<not a list>",
+                model, stream, status,
+            )
+            return
+        LOG.warning(
+            "failed request dump: model=%s stream=%s status=%s message_count=%s",
+            model, stream, status, len(messages),
+        )
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                LOG.warning("  [%s] <not a dict>: %s", i, repr(msg)[:120])
+                continue
+            role = msg.get("role", "?")
+            has_id = "id" in msg
+            msg_id = msg.get("id", "<missing>")
+            content = msg.get("content")
+            content_preview = ""
+            if isinstance(content, str):
+                content_preview = (
+                    content[:80].replace("\n", "\\n") + ("…" if len(content) > 80 else "")
+                )
+            tool_calls = msg.get("tool_calls")
+            tc_count = len(tool_calls) if isinstance(tool_calls, list) else 0
+            flags = []
+            if not has_id:
+                flags.append("NO_ID")
+            if tc_count:
+                flags.append(f"tool_calls={tc_count}")
+            flag_str = (" " + " ".join(flags)) if flags else ""
+            LOG.warning(
+                "  [%s] role=%s id=%s%s content=%r",
+                i, role, msg_id, flag_str, content_preview,
+            )
+        # In verbose mode also dump the full payload for deeper inspection.
+        if verbose:
+            log_json("failed upstream request body", payload)
 
     async def _upstream_error_response(
         self,
@@ -1284,6 +1368,23 @@ def int_or_zero(value: Any) -> int:
 
 def sse_data(payload: dict[str, Any]) -> bytes:
     return b"data: " + orjson.dumps(payload) + b"\n\n"
+
+
+def _clean_chunk_content_deltas(chunk: dict[str, Any]) -> None:
+    """Strip ``<tool_comment>`` / ``<tool_use>`` tags from every
+    ``delta.content`` in *chunk* so the client never sees raw markup."""
+    choices = chunk.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        content = delta.get("content")
+        if isinstance(content, str):
+            delta["content"] = strip_tool_tags(content)
 
 
 def inject_recovery_notice(

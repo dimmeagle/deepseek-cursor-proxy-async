@@ -7,10 +7,38 @@ from typing import Any
 from .reasoning_store import ReasoningStore
 
 
+import re as _re
+
 THINKING_BLOCK_START = "<think>\n"
 THINKING_BLOCK_END = "\n</think>\n\n"
 COLLAPSIBLE_THINKING_BLOCK_START = "<details>\n<summary>Thinking</summary>\n\n"
 COLLAPSIBLE_THINKING_BLOCK_END = "\n</details>\n\n"
+
+# DeepSeek thinking models may emit internal XML-like tags (tool_comment,
+# tool_use) in reasoning_content when tools are unavailable.  Strip those
+# before mirroring reasoning into user-visible content so Continue / Cursor
+# don't show raw markup to the user.
+_TOOL_TAG_RE = _re.compile(
+    r"""
+    <tool_(?:comment|use)\b[^>]*>
+    [\s\S]*?
+    </tool_(?:comment|use)>
+    """,
+    _re.IGNORECASE | _re.VERBOSE,
+)
+
+
+def strip_tool_tags(text: str) -> str:
+    """Remove ``<tool_comment>…</tool_comment>`` and ``<tool_use>…</tool_use>``
+    blocks (DeepSeek internal thinking artefacts) from *text*."""
+    if not text:
+        return text
+    # Fast path: skip regex when the text clearly doesn't contain either tag
+    # (case-insensitive check to catch uppercase variants like <TOOL_COMMENT>).
+    lower = text.lower()
+    if "<tool_comment" not in lower and "<tool_use" not in lower:
+        return text
+    return _TOOL_TAG_RE.sub("", text)
 
 
 @dataclass
@@ -239,6 +267,15 @@ class CursorReasoningDisplayAdapter:
                 delta = {}
                 raw_choice["delta"] = delta
 
+            # Strip DeepSeek internal tool tags from deltas so they never
+            # reach user-visible content (Continue / Cursor display).
+            _reasoning = delta.get("reasoning_content")
+            if isinstance(_reasoning, str):
+                delta["reasoning_content"] = strip_tool_tags(_reasoning)
+            _content_delta = delta.get("content")
+            if isinstance(_content_delta, str):
+                delta["content"] = strip_tool_tags(_content_delta)
+
             mirrored_parts: list[str] = []
             reasoning_content = delta.get("reasoning_content")
             if isinstance(reasoning_content, str) and reasoning_content:
@@ -314,12 +351,18 @@ def fold_reasoning_into_content(
         if not isinstance(message, dict):
             continue
         reasoning = message.get("reasoning_content")
-        if not isinstance(reasoning, str) or not reasoning:
+        if isinstance(reasoning, str):
+            reasoning = strip_tool_tags(reasoning)
+            message["reasoning_content"] = reasoning
+        if not reasoning:
             continue
         content = message.get("content")
+        cleaned_content = (
+            strip_tool_tags(content) if isinstance(content, str) else content
+        )
         message["content"] = (
             block_start
             + reasoning
             + block_end
-            + (content if isinstance(content, str) else "")
+            + (cleaned_content if isinstance(cleaned_content, str) else "")
         )
