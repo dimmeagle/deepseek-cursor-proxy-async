@@ -110,16 +110,37 @@ RECOVERY_SYSTEM_CONTENT = (
 
 def ensure_message_id(message: dict[str, Any], index: int | None = None) -> dict[str, Any]:
     """Ensure the message dict has a **non-empty** ``id`` field for upstream
-    DeepSeek API compatibility. DeepSeek v4 requires every message in the
-    ``messages`` array to carry an ``id``. If the client didn't supply one,
-    supplied an empty / null value, or the proxy synthesised the message,
-    inject a stable proxy-generated identifier."""
+    DeepSeek API compatibility and that it is the **first** key in the dict.
+
+    DeepSeek v4 requires every message in the ``messages`` array to carry an
+    ``id``.  If the client didn't supply one, supplied an empty / null value,
+    or the proxy synthesised the message, inject a stable proxy-generated
+    identifier.
+
+    Additionally, the ``id`` key is moved (or inserted) as the first key so
+    that it serialises before ``tool_calls`` and other deeply-nested fields.
+    DeepSeek's streaming deserialiser may fail with "missing field ``id``"
+    when the key appears after a large nested structure like ``tool_calls``.
+    """
     existing = message.get("id")
     if not isinstance(existing, str) or not existing.strip():
         if index is not None:
-            message["id"] = f"proxy-msg-{index}"
+            new_id = f"proxy-msg-{index}"
         else:
-            message["id"] = f"proxy-msg-{uuid.uuid4().hex[:12]}"
+            new_id = f"proxy-msg-{uuid.uuid4().hex[:12]}"
+    else:
+        new_id = existing
+
+    # Rebuild the dict with 'id' as the first key so it serialises at the
+    # front of the JSON object.  Clients like Cursor naturally include 'id'
+    # early, but clients like Continue (VS Code) omit it, causing the proxy
+    # to append it last — after 'tool_calls'.  That order triggers a
+    # deserialisation bug in the DeepSeek v4 API.
+    items = [(k, v) for k, v in message.items() if k != "id"]
+    message.clear()
+    message["id"] = new_id
+    for k, v in items:
+        message[k] = v
     return message
 
 
