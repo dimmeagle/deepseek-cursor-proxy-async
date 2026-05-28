@@ -7,6 +7,8 @@ import orjson
 import re
 from typing import Any
 
+import uuid
+
 from .config import ProxyConfig
 from .logging import LOG
 from .reasoning_store import (
@@ -104,6 +106,19 @@ RECOVERY_SYSTEM_CONTENT = (
     "unrecoverable tool-call history was omitted; continue using only the "
     "remaining recovered context."
 )
+
+
+def ensure_message_id(message: dict[str, Any], index: int | None = None) -> dict[str, Any]:
+    """Ensure the message dict has an ``id`` field for upstream DeepSeek API
+    compatibility. DeepSeek v4 requires every message in the ``messages``
+    array to carry an ``id``. If the client didn't supply one or the proxy
+    synthesised the message, inject a stable proxy-generated identifier."""
+    if "id" not in message:
+        if index is not None:
+            message["id"] = f"proxy-msg-{index}"
+        else:
+            message["id"] = f"proxy-msg-{uuid.uuid4().hex[:12]}"
+    return message
 
 
 @dataclass(frozen=True)
@@ -256,7 +271,7 @@ def normalize_message(
     keep_reasoning: bool,
 ) -> tuple[dict[str, Any], bool, bool, dict[str, Any] | None]:
     if not isinstance(message, dict):
-        message = {"role": "user", "content": str(message)}
+        message = {"id": f"proxy-msg-{len(prior_messages)}", "role": "user", "content": str(message)}
     normalized = {key: value for key, value in message.items() if key in MESSAGE_FIELDS}
     role = normalized.get("role") or "user"
     normalized["role"] = role
@@ -353,6 +368,7 @@ def normalize_message(
     normalized = {
         key: value for key, value in normalized.items() if key in allowed_fields
     }
+    ensure_message_id(normalized, len(prior_messages))
     return normalized, patched, missing, diagnostic
 
 
@@ -569,7 +585,7 @@ def active_messages_from_recovery_boundary(
     recovered_tail.extend(messages[recovery_boundary_index:])
     active_messages = [
         *leading_messages,
-        {"role": "system", "content": RECOVERY_SYSTEM_CONTENT},
+        {"id": "proxy-msg-recovery-boundary", "role": "system", "content": RECOVERY_SYSTEM_CONTENT},
         *recovered_tail,
     ]
     kept_context_messages = 1 if context_user_index != -1 else 0
@@ -615,7 +631,7 @@ def recover_messages_from_missing_reasoning(
         recovered_tail.extend(messages[recovery_boundary_index:])
         recovered = [
             *leading_messages,
-            {"role": "system", "content": RECOVERY_SYSTEM_CONTENT},
+            {"id": "proxy-msg-recovery-system", "role": "system", "content": RECOVERY_SYSTEM_CONTENT},
             *recovered_tail,
         ]
         kept_context_messages = 1 if context_user_index != -1 else 0
@@ -660,7 +676,7 @@ def recover_messages_from_missing_reasoning(
 
     recovered = leading_system_messages(messages)
     omitted_messages = len(messages) - len(recovered) - 1
-    recovered.append({"role": "system", "content": RECOVERY_SYSTEM_CONTENT})
+    recovered.append({"id": "proxy-msg-recovery-system", "role": "system", "content": RECOVERY_SYSTEM_CONTENT})
     recovered.append(messages[last_user_index])
     return (
         recovered,
