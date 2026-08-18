@@ -10,6 +10,8 @@ import threading
 import time
 from typing import Any
 
+from .logging import LOG
+
 
 TRACE_SCHEMA_VERSION = 1
 
@@ -136,6 +138,25 @@ def payload_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "system_prompt_hashes": system_hashes,
         "messages": message_summaries(payload),
     }
+
+
+def log_system_prompts(payload: dict[str, Any]) -> None:
+    """Log the system prompt(s) carried by an incoming chat request."""
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        LOG.info(
+            "system prompt message_index=%d characters=%d:\n%s",
+            index,
+            len(content),
+            content,
+        )
 
 
 def write_json_private(path: Path, payload: dict[str, Any]) -> None:
