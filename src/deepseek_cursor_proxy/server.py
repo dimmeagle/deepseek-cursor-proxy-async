@@ -39,7 +39,7 @@ from .streaming import (
     StreamAccumulator,
     strip_tool_tags,
 )
-from .trace import TraceRequest, TraceWriter
+from .trace import TraceRequest, TraceWriter, log_system_prompts
 from .tunnel import NgrokTunnel, local_tunnel_target
 from .transform import (
     RECOVERY_NOTICE_CONTENT,
@@ -204,6 +204,7 @@ class DeepSeekProxyHandler:
             log_json("cursor request body", payload)
 
         log_cursor_request(payload, self.config)
+        log_system_prompts(payload)
 
         # ── Prepare upstream request ──────────────────────────────
         prepared = prepare_upstream_request(
