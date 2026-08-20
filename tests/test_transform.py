@@ -220,6 +220,76 @@ class RequestPreparationTests(unittest.TestCase):
         )
         self.assertEqual(prepared.missing_reasoning_messages, 0)
 
+    def test_plain_assistant_message_is_repaired_from_cache(self) -> None:
+        """DeepSeek V4 (0813+) rejects any historical assistant message
+        lacking reasoning_content in a multi-turn request carrying tools,
+        not just tool-call turns.  A cached plain (non-tool) assistant
+        message must be repaired too."""
+        prior = [{"role": "user", "content": "Hello!"}]
+        plain_answer = {
+            "role": "assistant",
+            "content": "Hello! I am here.",
+            "reasoning_content": "Thinking about the greeting.",
+        }
+        self.store.store_assistant_message(
+            plain_answer,
+            conversation_scope(prior, _default_cache_namespace()),
+            _default_cache_namespace(),
+            prior,
+        )
+
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [
+                    *prior,
+                    {
+                        "role": "assistant",
+                        "content": "Hello! I am here.",
+                    },
+                    {"role": "user", "content": "What is 1+1?"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "get_date", "parameters": {}},
+                    }
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertEqual(prepared.missing_reasoning_messages, 0)
+        self.assertEqual(prepared.patched_reasoning_messages, 1)
+        self.assertEqual(
+            prepared.payload["messages"][1]["reasoning_content"],
+            "Thinking about the greeting.",
+        )
+
+    def test_plain_assistant_message_without_cache_is_not_missing(self) -> None:
+        """A plain assistant message with no cached reasoning must NOT
+        trigger history recovery — only tool-turn messages may."""
+        prepared = prepare_upstream_request(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                    {"role": "user", "content": "again"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "get_date", "parameters": {}},
+                    }
+                ],
+            },
+            ProxyConfig(),
+            self.store,
+        )
+        self.assertEqual(prepared.missing_reasoning_messages, 0)
+        self.assertEqual(prepared.recovered_reasoning_messages, 0)
+
 
 class RecoveryNoticeStrippingTests(unittest.TestCase):
     def test_strips_only_the_recovery_notice_prefix(self) -> None:

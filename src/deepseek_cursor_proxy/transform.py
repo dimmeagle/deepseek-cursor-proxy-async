@@ -336,18 +336,21 @@ def normalize_message(
                     normalized, prior_messages
                 )
                 lookup_scope = conversation_scope(prior_messages, cache_namespace)
-                lookup_keys = (
-                    reasoning_lookup_keys(
-                        normalized,
-                        lookup_scope,
-                        cache_namespace,
-                        prior_messages,
-                    )
-                    if needs_reasoning
-                    else []
+                # DeepSeek V4 (0813+) rejects any historical assistant
+                # message that lacks reasoning_content in a multi-turn
+                # request carrying tools, not just tool-call turns.  Repair
+                # every assistant message from the cache, but only tool-turn
+                # messages count as `missing` (and can trigger history
+                # recovery) when no cached reasoning exists: plain turns may
+                # legitimately have no reasoning on record.
+                lookup_keys = reasoning_lookup_keys(
+                    normalized,
+                    lookup_scope,
+                    cache_namespace,
+                    prior_messages,
                 )
                 hit_kind = None
-                if needs_reasoning and store is not None:
+                if store is not None:
                     for lookup_key in lookup_keys:
                         restored = store.get(str(lookup_key["key"]))
                         if restored is not None:
@@ -365,11 +368,11 @@ def normalize_message(
                             break
                 if needs_reasoning and not patched:
                     missing = True
-                if needs_reasoning:
+                if needs_reasoning or patched:
                     diagnostic = {
                         "message_index": len(prior_messages),
                         "role": "assistant",
-                        "needs_reasoning": True,
+                        "needs_reasoning": needs_reasoning,
                         "had_reasoning_content": False,
                         "patched": patched,
                         "missing": missing,
