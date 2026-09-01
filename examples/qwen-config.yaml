@@ -1,10 +1,13 @@
 # Example: Qwen via DashScope OpenAI-compatible API
 # Start with:
+#   set UPSTREAM_API_KEY=sk-your-dashscope-key
 #   deepseek-cursor-proxy --config examples/qwen-config.yaml --no-ngrok
+#
+# API key is read from UPSTREAM_API_KEY (or DEEPSEEK_API_KEY) — not from this file.
+# Do not commit real keys here.
 
 base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-model: qwen-max
-api_key: sk-your-dashscope-key-here
+model: qwen3.8-flash
 
 # DeepSeek-specific thinking/reasoning fields are not used by Qwen.
 thinking: disabled
