@@ -1644,6 +1644,13 @@ async def async_main(args: argparse.Namespace) -> int:
     )
     if config.upstream_api_key:
         LOG.info("upstream_api_key: configured (fixed key for all requests)")
+    else:
+        LOG.warning(
+            "upstream_api_key: not set — forwarding the client's "
+            "Authorization header to %s; set UPSTREAM_API_KEY or "
+            "--api-key for DashScope/Qwen",
+            config.upstream_base_url,
+        )
 
     if config.verbose:
         display_reasoning = "off"

@@ -1,18 +1,38 @@
 # Example: Qwen via DashScope OpenAI-compatible API
-# Start with:
-#   set UPSTREAM_API_KEY=sk-your-dashscope-key
-#   deepseek-cursor-proxy --config examples/qwen-config.yaml --no-ngrok
 #
-# API key is read from UPSTREAM_API_KEY (or DEEPSEEK_API_KEY) — not from this file.
-# Do not commit real keys here.
+# 1) Set your DashScope API key (same terminal session as the proxy):
+#      $env:UPSTREAM_API_KEY = "sk-..."
+# 2) Set base_url to match your key's region (see below).
+# 3) Start:
+#      deepseek-cursor-proxy --config examples/qwen-config.yaml --no-ngrok
+#
+# On startup you should see:
+#   upstream_api_key: configured (fixed key for all requests)
+# If you see "not set — forwarding the client's Authorization header",
+# DashScope will reject Cursor's fake key with invalid_api_key.
 
-base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+# --- Pick ONE base_url for your key's region ---
+#
+# China (Beijing) — workspace key (recommended, key often starts with sk-ws-):
+#   base_url: https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+#
+# China (Beijing) — legacy shared endpoint (older sk- keys):
+#   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+#
+# International (Singapore):
+#   base_url: https://YOUR_WORKSPACE_ID.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+#   or legacy: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+#
+# US (Virginia):
+#   base_url: https://dashscope-us.aliyuncs.com/compatible-mode/v1
+
+base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 model: qwen3.8-flash
 
 # DeepSeek-specific thinking/reasoning fields are not used by Qwen.
 thinking: disabled
 
-host: 127.0.0.1
+host: 0.0.0.0
 port: 9000
 ngrok: false
 verbose: true
