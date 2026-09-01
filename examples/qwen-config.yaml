@@ -15,4 +15,4 @@ thinking: disabled
 host: 127.0.0.1
 port: 9000
 ngrok: false
-verbose: false
+verbose: true
