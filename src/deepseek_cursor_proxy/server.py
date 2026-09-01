@@ -27,6 +27,7 @@ from .config import (
     ProxyConfig,
     default_config_path,
     default_reasoning_content_path,
+    resolve_upstream_api_key,
 )
 from .logging import (
     LOG,
@@ -793,9 +794,8 @@ class DeepSeekProxyHandler:
     def _cursor_authorization(
         self, request: web.Request
     ) -> str | None:
-        deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY")
-        if deepseek_api_key:
-            return f"Bearer {deepseek_api_key.strip()}"
+        if self.config.upstream_api_key:
+            return f"Bearer {self.config.upstream_api_key}"
         auth_header = request.headers.get("Authorization", "")
         scheme, separator, token = auth_header.strip().partition(" ")
         if (
@@ -1063,8 +1063,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-url",
         help=(
-            "DeepSeek base URL, "
+            "Upstream OpenAI-compatible base URL, "
             "default from config or https://api.deepseek.com"
+        ),
+    )
+    parser.add_argument(
+        "--api-key",
+        help=(
+            "Upstream API key for all requests; overrides config file and "
+            "UPSTREAM_API_KEY / DEEPSEEK_API_KEY environment variables"
         ),
     )
     parser.add_argument(
@@ -1516,6 +1523,9 @@ def build_config_from_args(
         updates["upstream_model"] = args.model
     if args.base_url is not None:
         updates["upstream_base_url"] = args.base_url.rstrip("/")
+    if args.api_key is not None:
+        stripped = str(args.api_key).strip()
+        updates["upstream_api_key"] = stripped if stripped else None
     if args.thinking is not None:
         updates["thinking"] = args.thinking
     if args.reasoning_effort is not None:
@@ -1553,6 +1563,22 @@ def build_config_from_args(
         )
     if updates:
         config = replace(config, **updates)
+
+    env_updates: dict[str, Any] = {}
+    if args.base_url is None:
+        env_base_url = os.environ.get("UPSTREAM_BASE_URL")
+        if env_base_url:
+            env_updates["upstream_base_url"] = env_base_url.strip().rstrip("/")
+    if args.model is None:
+        env_model = os.environ.get("UPSTREAM_MODEL")
+        if env_model:
+            env_updates["upstream_model"] = env_model.strip()
+    if args.api_key is None:
+        resolved_api_key = resolve_upstream_api_key(config.upstream_api_key)
+        if resolved_api_key != config.upstream_api_key:
+            env_updates["upstream_api_key"] = resolved_api_key
+    if env_updates:
+        config = replace(config, **env_updates)
 
     configure_logging(verbose=config.verbose)
     warn_if_insecure_upstream(config.upstream_base_url)
@@ -1612,6 +1638,12 @@ async def async_main(args: argparse.Namespace) -> int:
         "thinking" if config.thinking == "enabled" else "no thinking",
         config.reasoning_effort,
     )
+    LOG.info(
+        "upstream_url: %s/chat/completions",
+        config.upstream_base_url,
+    )
+    if config.upstream_api_key:
+        LOG.info("upstream_api_key: configured (fixed key for all requests)")
 
     if config.verbose:
         display_reasoning = "off"

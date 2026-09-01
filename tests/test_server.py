@@ -8,13 +8,16 @@ import asyncio
 import gzip
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import sys
 import threading
 import time
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import MagicMock, patch
 import zlib
 
 from aiohttp import web
@@ -32,6 +35,7 @@ from deepseek_cursor_proxy.reasoning_store import ReasoningStore
 from deepseek_cursor_proxy.server import (
     DeepSeekProxyHandler,
     build_arg_parser,
+    build_config_from_args,
     read_response_body,
     summarize_chat_payload,
     create_app,
@@ -157,6 +161,67 @@ class CliAndHelperTests(unittest.TestCase):
             ["--ngrok-url", "https://example.ngrok.app"]
         )
         self.assertEqual(args.ngrok_url, "https://example.ngrok.app")
+
+    def test_cli_accepts_upstream_connection_flags(self) -> None:
+        args = build_arg_parser().parse_args(
+            [
+                "--base-url",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "--model",
+                "qwen-max",
+                "--api-key",
+                "sk-qwen",
+            ]
+        )
+        self.assertEqual(
+            args.base_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        self.assertEqual(args.model, "qwen-max")
+        self.assertEqual(args.api_key, "sk-qwen")
+
+    def test_cursor_authorization_uses_configured_upstream_api_key(self) -> None:
+        handler = _make_handler_stub(upstream_api_key="sk-fixed")
+        request = MagicMock()
+        request.headers.get.return_value = "Bearer sk-from-cursor"
+        self.assertEqual(
+            handler._cursor_authorization(request),
+            "Bearer sk-fixed",
+        )
+
+    def test_build_config_from_args_applies_env_overrides(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "base_url: https://api.deepseek.com",
+                        "model: deepseek-v4-pro",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "UPSTREAM_BASE_URL": "https://example.com/v1",
+                    "UPSTREAM_MODEL": "qwen-max",
+                    "UPSTREAM_API_KEY": "sk-env",
+                },
+            ):
+                config, store, _ = build_config_from_args(
+                    build_arg_parser().parse_args(
+                        ["--config", str(config_path), "--no-ngrok"]
+                    )
+                )
+            try:
+                self.assertEqual(
+                    config.upstream_base_url, "https://example.com/v1"
+                )
+                self.assertEqual(config.upstream_model, "qwen-max")
+                self.assertEqual(config.upstream_api_key, "sk-env")
+            finally:
+                store.close()
 
     def test_create_app_client_max_size_matches_config(self) -> None:
         store = ReasoningStore(":memory:")

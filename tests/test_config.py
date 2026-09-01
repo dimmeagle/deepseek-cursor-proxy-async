@@ -20,6 +20,7 @@ from deepseek_cursor_proxy.config import (
     ProxyConfig,
     default_config_path,
     default_reasoning_content_path,
+    resolve_upstream_api_key,
 )
 
 
@@ -277,6 +278,36 @@ class ConfigTests(unittest.TestCase):
             )
 
         self.assertFalse(config.verbose)
+
+    def test_loads_api_key_from_config_file(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text("api_key: sk-from-config\n", encoding="utf-8")
+
+            config = ProxyConfig.from_file(config_path=config_path)
+
+        self.assertEqual(config.upstream_api_key, "sk-from-config")
+
+    def test_resolve_upstream_api_key_prefers_environment(self) -> None:
+        resolved = resolve_upstream_api_key(
+            "sk-from-config",
+            env={
+                "UPSTREAM_API_KEY": "sk-from-env",
+                "DEEPSEEK_API_KEY": "sk-legacy",
+            },
+        )
+        self.assertEqual(resolved, "sk-from-env")
+
+    def test_resolve_upstream_api_key_falls_back_to_legacy_env_name(self) -> None:
+        resolved = resolve_upstream_api_key(
+            None,
+            env={"DEEPSEEK_API_KEY": "sk-legacy"},
+        )
+        self.assertEqual(resolved, "sk-legacy")
+
+    def test_resolve_upstream_api_key_uses_config_when_env_missing(self) -> None:
+        resolved = resolve_upstream_api_key("sk-from-config", env={})
+        self.assertEqual(resolved, "sk-from-config")
 
 
 if __name__ == "__main__":

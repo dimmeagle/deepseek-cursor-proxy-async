@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from typing import Any
 
@@ -40,10 +41,15 @@ DEFAULT_CONFIG_HEADER = (
     "# This file was created automatically at ~/.deepseek-cursor-proxy/config.yaml."
 )
 DEFAULT_CONFIG_TEXT = f"""{DEFAULT_CONFIG_HEADER}
-# API keys are read from Cursor's Authorization header and forwarded upstream.
+# Upstream API key resolution (first match wins):
+#   1. --api-key CLI flag
+#   2. api_key in this file
+#   3. UPSTREAM_API_KEY or DEEPSEEK_API_KEY environment variable
+#   4. Authorization bearer token from the client (e.g. Cursor)
+# api_key: sk-your-key-here
 
 # `model` is the fallback when a request has no model; Cursor's requested
-# DeepSeek model name is otherwise respected.
+# model name is rewritten to this value unless it is a known DeepSeek name.
 base_url: {DEFAULT_UPSTREAM_BASE_URL}
 model: {DEFAULT_UPSTREAM_MODEL}
 thinking: {DEFAULT_THINKING}
@@ -199,12 +205,33 @@ def normalize_missing_reasoning_strategy(value: Any) -> str:
     return DEFAULT_MISSING_REASONING_STRATEGY
 
 
+def resolve_upstream_api_key(
+    configured_key: str | None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve upstream API key from environment variables and config."""
+    environment = os.environ if env is None else env
+    for env_name in ("UPSTREAM_API_KEY", "DEEPSEEK_API_KEY"):
+        candidate = environment.get(env_name)
+        if candidate:
+            stripped = candidate.strip()
+            if stripped:
+                return stripped
+    if configured_key:
+        stripped = configured_key.strip()
+        if stripped:
+            return stripped
+    return None
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     upstream_base_url: str = DEFAULT_UPSTREAM_BASE_URL
     upstream_model: str = DEFAULT_UPSTREAM_MODEL
+    upstream_api_key: str | None = None
     thinking: str = DEFAULT_THINKING
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT
@@ -250,6 +277,7 @@ class ProxyConfig:
                 setting_value(settings, "model"),
                 DEFAULT_UPSTREAM_MODEL,
             ),
+            upstream_api_key=as_optional_str(setting_value(settings, "api_key")),
             thinking=normalize_thinking(setting_value(settings, "thinking")),
             reasoning_effort=as_str(
                 setting_value(settings, "reasoning_effort"),

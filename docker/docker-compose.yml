@@ -6,6 +6,9 @@ services:
     container_name: deepseek-cursor-proxy-async
     restart: unless-stopped
     environment:
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - UPSTREAM_BASE_URL=${UPSTREAM_BASE_URL}
+      - UPSTREAM_MODEL=${UPSTREAM_MODEL}
     ports:
       - "${DEEPSEEK_PROXY_IP:-127.0.0.1}:${DEEPSEEK_PROXY_PORT:-9088}:9000"

@@ -65,9 +65,46 @@ pip install -e .
 deepseek-cursor-proxy
 ```
 
-> **API key resolution:** The proxy resolves the upstream DeepSeek API key in the following order:
-> 1. **`DEEPSEEK_API_KEY` environment variable** — if set, this key is used for **all** upstream requests regardless of what the client sends. Useful for shared proxy deployments.
-> 2. **Incoming `Authorization` header** — if `DEEPSEEK_API_KEY` is not set, the proxy forwards each client's API key as-is. This allows multiple clients to use their own DeepSeek keys through a single proxy instance.
+> **API key resolution:** The proxy resolves the upstream API key in the following order:
+> 1. **`--api-key` CLI flag** — highest priority at startup.
+> 2. **`api_key` in config file** — see `~/.deepseek-cursor-proxy/config.yaml`.
+> 3. **`UPSTREAM_API_KEY` or `DEEPSEEK_API_KEY` environment variable** — useful for Docker and CI.
+> 4. **Incoming `Authorization` header** — forwarded from the client (e.g. Cursor) when no fixed key is configured.
+
+## Upstream provider (DeepSeek, Qwen, etc.)
+
+The proxy speaks the OpenAI Chat Completions protocol upstream. **URL**, **model**, and **API key** can be changed at startup via config file, CLI flags, or environment variables.
+
+| Setting | Config file | CLI | Environment |
+|---------|-------------|-----|-------------|
+| Base URL | `base_url` | `--base-url` | `UPSTREAM_BASE_URL` |
+| Model | `model` | `--model` | `UPSTREAM_MODEL` |
+| API key | `api_key` | `--api-key` | `UPSTREAM_API_KEY` or `DEEPSEEK_API_KEY` |
+
+CLI flags override the config file. Environment variables override the config file when the matching CLI flag is not set.
+
+### Example: Qwen (DashScope)
+
+```bash
+# Option 1: project config file
+deepseek-cursor-proxy --config examples/qwen-config.yaml --no-ngrok
+
+# Option 2: CLI flags
+deepseek-cursor-proxy \
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --model qwen-max \
+  --api-key sk-your-dashscope-key \
+  --thinking disabled \
+  --no-ngrok
+
+# Option 3: environment variables
+export UPSTREAM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+export UPSTREAM_MODEL=qwen-max
+export UPSTREAM_API_KEY=sk-your-dashscope-key
+deepseek-cursor-proxy --thinking disabled --no-ngrok
+```
+
+For non-DeepSeek providers, set `thinking: disabled` in config (or `--thinking disabled`). Cursor's model name is rewritten to your configured `model` unless it starts with `deepseek-`.
 
 ## Docker Setup
 
