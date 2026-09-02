@@ -1,15 +1,14 @@
 # Example: Qwen via DashScope OpenAI-compatible API
 #
-# 1) Set your DashScope API key (same terminal session as the proxy):
-#      $env:UPSTREAM_API_KEY = "sk-..."
-# 2) Set base_url to match your key's region (see below).
-# 3) Start:
-#      deepseek-cursor-proxy --config examples/qwen-config.yaml --no-ngrok
+# Option A — .env in project root (loaded automatically at startup):
+#   UPSTREAM_API_KEY=sk-...
+#   UPSTREAM_MODEL=qwen3.8-flash
 #
-# On startup you should see:
-#   upstream_api_key: configured (fixed key for all requests)
-# If you see "not set — forwarding the client's Authorization header",
-# DashScope will reject Cursor's fake key with invalid_api_key.
+# Option B — set in this file:
+#   model: qwen3.8-flash
+#
+# Start:
+#   deepseek-cursor-proxy --config examples/qwen-config.yaml --no-ngrok
 
 # --- Pick ONE base_url for your key's region ---
 #

@@ -225,6 +225,51 @@ def resolve_upstream_api_key(
     return None
 
 
+def is_deepseek_upstream(base_url: str) -> bool:
+    """Return True when the configured upstream looks like DeepSeek's API."""
+    return "deepseek.com" in base_url.lower()
+
+
+def load_dotenv_file(path: str | Path) -> None:
+    """Load KEY=VALUE pairs from a .env file without overriding existing env."""
+    dotenv_path = Path(path).expanduser()
+    if not dotenv_path.is_file():
+        return
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        env_name = key.strip()
+        if not env_name or env_name in os.environ:
+            continue
+        env_value = value.strip()
+        if len(env_value) >= 2 and env_value[0] == env_value[-1] and env_value[0] in {
+            '"',
+            "'",
+        }:
+            env_value = env_value[1:-1]
+        os.environ[env_name] = env_value
+
+
+def load_dotenv_files(*paths: str | Path | None) -> None:
+    """Load .env files in order; the first file wins for each variable."""
+    for path in paths:
+        if path is not None:
+            load_dotenv_file(path)
+
+
+def discover_dotenv_paths(config_path: str | Path | None = None) -> list[Path]:
+    paths = [Path.cwd() / ".env"]
+    if config_path is not None:
+        paths.append(Path(config_path).expanduser().parent / ".env")
+    return paths
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     host: str = DEFAULT_HOST

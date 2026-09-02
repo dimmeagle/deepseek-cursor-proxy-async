@@ -850,7 +850,11 @@ class HttpBoundaryTests(unittest.TestCase):
         output = "\n".join(captured.output)
         self.assertEqual(status, 200)
         self.assertIn(
-            "\u250c request model=deepseek-v4-pro effort=max messages=1",
+            "\u250c request request_model=deepseek-v4-pro effort=max messages=1",
+            output,
+        )
+        self.assertIn(
+            "\u251c model  request_model=deepseek-v4-pro upstream_model=deepseek-v4-pro",
             output,
         )
         self.assertIn("\u251c context status=ok reasoning_context=0", output)

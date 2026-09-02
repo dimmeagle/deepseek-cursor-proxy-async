@@ -27,6 +27,9 @@ from .config import (
     ProxyConfig,
     default_config_path,
     default_reasoning_content_path,
+    discover_dotenv_paths,
+    is_deepseek_upstream,
+    load_dotenv_files,
     resolve_upstream_api_key,
 )
 from .logging import (
@@ -110,21 +113,26 @@ class DeepSeekProxyHandler:
 
     async def models(self, request: web.Request) -> web.Response:
         created = int(time.time())
-        model_ids = list(
-            dict.fromkeys(
-                [
-                    self.config.upstream_model,
-                    "deepseek-v4-pro",
-                    "deepseek-v4-flash",
-                ]
+        if is_deepseek_upstream(self.config.upstream_base_url):
+            model_ids = list(
+                dict.fromkeys(
+                    [
+                        self.config.upstream_model,
+                        "deepseek-v4-pro",
+                        "deepseek-v4-flash",
+                    ]
+                )
             )
-        )
+            owned_by = "deepseek"
+        else:
+            model_ids = [self.config.upstream_model]
+            owned_by = "proxy"
         models_list = [
             {
                 "id": model_id,
                 "object": "model",
                 "created": created,
-                "owned_by": "deepseek",
+                "owned_by": owned_by,
             }
             for model_id in model_ids
         ]
@@ -216,6 +224,7 @@ class DeepSeekProxyHandler:
         )
         if trace is not None:
             trace.record_transform(prepared)
+        log_model_routing(prepared)
         log_context_summary(prepared)
 
         # ── Reject mode (strict) ──────────────────────────────────
@@ -1237,12 +1246,29 @@ def log_cursor_request(
     payload: dict[str, Any],
     config: ProxyConfig,
 ) -> None:
-    model = str(payload.get("model") or config.upstream_model)
+    request_model = payload.get("model")
+    if request_model is None:
+        LOG.info(
+            "\u250c request request_model=<absent> configured_model=%s "
+            "effort=%s messages=%s",
+            config.upstream_model,
+            config.reasoning_effort,
+            format_count(message_count(payload)),
+        )
+        return
     LOG.info(
-        "\u250c request model=%s effort=%s messages=%s",
-        model,
+        "\u250c request request_model=%s effort=%s messages=%s",
+        request_model,
         config.reasoning_effort,
         format_count(message_count(payload)),
+    )
+
+
+def log_model_routing(prepared: Any) -> None:
+    LOG.info(
+        "\u251c model  request_model=%s upstream_model=%s",
+        prepared.original_model,
+        prepared.upstream_model,
     )
 
 
@@ -1507,6 +1533,7 @@ def build_config_from_args(
     args: argparse.Namespace,
 ) -> tuple[ProxyConfig, ReasoningStore, TraceWriter | None]:
     """Parse CLI args and wire up config, reasoning store and trace writer."""
+    load_dotenv_files(*discover_dotenv_paths(args.config_path))
     try:
         config = ProxyConfig.from_file(config_path=args.config_path)
     except ValueError as exc:

@@ -184,7 +184,28 @@ class RequestPreparationTests(unittest.TestCase):
                 self.store,
             )
         self.assertEqual(prepared.payload["model"], "deepseek-v4-pro")
-        self.assertIn("non-DeepSeek", "\n".join(captured.output))
+        self.assertIn("rewriting request model", "\n".join(captured.output))
+
+    def test_deepseek_request_model_is_rewritten_for_non_deepseek_upstream(
+        self,
+    ) -> None:
+        with self.assertLogs("deepseek_cursor_proxy", level="WARNING") as captured:
+            prepared = prepare_upstream_request(
+                {
+                    "model": "deepseek-v4-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                ProxyConfig(
+                    upstream_base_url=(
+                        "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                    ),
+                    upstream_model="qwen3.8-flash",
+                    thinking="disabled",
+                ),
+                self.store,
+            )
+        self.assertEqual(prepared.payload["model"], "qwen3.8-flash")
+        self.assertIn("deepseek-v4-flash", "\n".join(captured.output))
 
     def test_thinking_disabled_strips_reasoning_from_assistant_history(self) -> None:
         prepared = prepare_upstream_request(

@@ -9,7 +9,7 @@ from typing import Any
 
 import uuid
 
-from .config import ProxyConfig
+from .config import ProxyConfig, is_deepseek_upstream
 from .logging import LOG
 from .reasoning_store import (
     ReasoningStore,
@@ -741,13 +741,17 @@ def assistant_needs_reasoning_for_tool_context(
 
 
 def upstream_model_for(original_model: str, config: ProxyConfig) -> str:
-    if original_model.startswith("deepseek-"):
+    if (
+        is_deepseek_upstream(config.upstream_base_url)
+        and original_model.startswith("deepseek-")
+    ):
         return original_model
-    LOG.warning(
-        "rewriting non-DeepSeek model %r to configured fallback %r",
-        original_model,
-        config.upstream_model,
-    )
+    if original_model != config.upstream_model:
+        LOG.warning(
+            "rewriting request model %r to configured upstream model %r",
+            original_model,
+            config.upstream_model,
+        )
     return config.upstream_model
 
 

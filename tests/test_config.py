@@ -20,6 +20,7 @@ from deepseek_cursor_proxy.config import (
     ProxyConfig,
     default_config_path,
     default_reasoning_content_path,
+    load_dotenv_file,
     resolve_upstream_api_key,
 )
 
@@ -308,6 +309,32 @@ class ConfigTests(unittest.TestCase):
     def test_resolve_upstream_api_key_uses_config_when_env_missing(self) -> None:
         resolved = resolve_upstream_api_key("sk-from-config", env={})
         self.assertEqual(resolved, "sk-from-config")
+
+    def test_load_dotenv_file_sets_missing_environment_variables(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            dotenv_path = Path(temp_dir) / ".env"
+            dotenv_path.write_text(
+                "\n".join(
+                    [
+                        "# comment",
+                        "UPSTREAM_MODEL=qwen3.8-flash",
+                        'UPSTREAM_API_KEY="sk-from-dotenv"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                load_dotenv_file(dotenv_path)
+                self.assertEqual(os.environ["UPSTREAM_MODEL"], "qwen3.8-flash")
+                self.assertEqual(os.environ["UPSTREAM_API_KEY"], "sk-from-dotenv")
+
+    def test_load_dotenv_file_does_not_override_existing_environment(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            dotenv_path = Path(temp_dir) / ".env"
+            dotenv_path.write_text("UPSTREAM_MODEL=qwen3.8-flash\n", encoding="utf-8")
+            with patch.dict(os.environ, {"UPSTREAM_MODEL": "existing"}, clear=True):
+                load_dotenv_file(dotenv_path)
+                self.assertEqual(os.environ["UPSTREAM_MODEL"], "existing")
 
 
 if __name__ == "__main__":
