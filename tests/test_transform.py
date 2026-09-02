@@ -205,7 +205,68 @@ class RequestPreparationTests(unittest.TestCase):
                 self.store,
             )
         self.assertEqual(prepared.payload["model"], "qwen3.8-flash")
+        self.assertNotIn("thinking", prepared.payload)
         self.assertIn("deepseek-v4-flash", "\n".join(captured.output))
+
+    def test_client_response_model_returns_upstream_for_non_deepseek(self) -> None:
+        from deepseek_cursor_proxy.transform import client_response_model
+
+        config = ProxyConfig(
+            upstream_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            upstream_model="qwen3.8-flash",
+        )
+        self.assertEqual(
+            client_response_model("deepseek-v4-flash", "qwen3.8-flash", config),
+            "qwen3.8-flash",
+        )
+
+    def test_normalize_assistant_content_unwraps_qwen_tool_call_markup(
+        self,
+    ) -> None:
+        from deepseek_cursor_proxy.transform import normalize_assistant_content
+
+        content = (
+            '<tool_call>\n{"tool": "search_web", "arguments": {"query": "x"}}\n'
+            "</tool_call>"
+        )
+        self.assertEqual(
+            normalize_assistant_content(content),
+            '{"tool": "search_web", "arguments": {"query": "x"}}',
+        )
+
+    def test_rewrite_response_body_uses_upstream_model_for_qwen(self) -> None:
+        body = json.dumps(
+            {
+                "id": "chatcmpl",
+                "object": "chat.completion",
+                "model": "qwen3.8-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                '<tool_call>{"tool": "search_web", '
+                                '"arguments": {"query": "x"}}</tool_call>'
+                            ),
+                        },
+                    }
+                ],
+            }
+        ).encode()
+        rewritten = rewrite_response_body(
+            body,
+            "qwen3.8-flash",
+            self.store,
+            [{"role": "user", "content": "hi"}],
+        )
+        payload = json.loads(rewritten)
+        self.assertEqual(payload["model"], "qwen3.8-flash")
+        self.assertEqual(
+            payload["choices"][0]["message"]["content"],
+            '{"tool": "search_web", "arguments": {"query": "x"}}',
+        )
 
     def test_thinking_disabled_strips_reasoning_from_assistant_history(self) -> None:
         prepared = prepare_upstream_request(
@@ -856,7 +917,7 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
         }
         rewrite_response_body(
             json.dumps(partial_response).encode("utf-8"),
-            original_model=first_prepared.original_model,
+            first_prepared.original_model,
             store=self.store,
             request_messages=first_prepared.record_response_messages,
             cache_namespace=first_prepared.cache_namespace,
@@ -940,8 +1001,8 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
             }
             rewrite_response_body(
                 json.dumps(response).encode("utf-8"),
-                original_model=prepared.original_model,
-                store=self.store,
+                prepared.original_model,
+                self.store,
                 request_messages=prepared.record_response_messages,
                 cache_namespace=prepared.cache_namespace,
                 scope=prepared.record_response_scope,

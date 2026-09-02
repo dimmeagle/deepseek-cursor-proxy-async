@@ -47,6 +47,8 @@ from .trace import TraceRequest, TraceWriter, log_system_prompts
 from .tunnel import NgrokTunnel, local_tunnel_target
 from .transform import (
     RECOVERY_NOTICE_CONTENT,
+    client_response_model,
+    normalize_assistant_content,
     prepare_upstream_request,
     rewrite_response_body,
 )
@@ -352,11 +354,16 @@ class DeepSeekProxyHandler:
             )
 
         try:
+            response_model = client_response_model(
+                prepared.original_model,
+                prepared.upstream_model,
+                self.config,
+            )
             if prepared.payload.get("stream"):
                 response = await self._proxy_streaming_response(
                     upstream_resp,
                     request,
-                    prepared.original_model,
+                    response_model,
                     prepared.payload["messages"],
                     prepared.cache_namespace,
                     prepared.recovery_notice,
@@ -368,7 +375,7 @@ class DeepSeekProxyHandler:
             else:
                 response = await self._proxy_regular_response(
                     upstream_resp,
-                    prepared.original_model,
+                    response_model,
                     prepared.payload["messages"],
                     prepared.cache_namespace,
                     prepared.recovery_notice,
@@ -379,7 +386,8 @@ class DeepSeekProxyHandler:
                 )
             spinner.stop()
             log_stats_summary(
-                getattr(response, "_usage", None)
+                getattr(response, "_usage", None),
+                response_model=response_model,
             )
             self._finish_trace(
                 trace,
@@ -427,7 +435,7 @@ class DeepSeekProxyHandler:
     async def _proxy_regular_response(
         self,
         upstream_resp: ClientResponse,
-        original_model: str,
+        response_model: str,
         request_messages: list[dict[str, Any]],
         cache_namespace: str,
         recovery_notice: str | None = None,
@@ -440,10 +448,11 @@ class DeepSeekProxyHandler:
         body = await upstream_resp.read()
         upstream_body = body
         usage = usage_from_body(upstream_body)
+        _warn_if_empty_upstream_response(upstream_body, response_model)
         try:
             body = rewrite_response_body(
                 body,
-                original_model,
+                response_model,
                 self.reasoning_store,
                 request_messages,
                 cache_namespace,
@@ -506,7 +515,7 @@ class DeepSeekProxyHandler:
         self,
         upstream_resp: ClientResponse,
         request: web.Request,
-        original_model: str,
+        response_model: str,
         request_messages: list[dict[str, Any]],
         cache_namespace: str,
         recovery_notice: str | None = None,
@@ -590,7 +599,7 @@ class DeepSeekProxyHandler:
                     chunk_usage,
                 ) = self._rewrite_sse_line(
                     line,
-                    original_model,
+                    response_model,
                     accumulator,
                     cache_namespace,
                     response_contexts,
@@ -644,7 +653,7 @@ class DeepSeekProxyHandler:
     def _rewrite_sse_line(
         self,
         line: bytes,
-        original_model: str,
+        response_model: str,
         accumulator: StreamAccumulator,
         cache_namespace: str,
         response_contexts: list[tuple[str, list[dict[str, Any]]]],
@@ -663,7 +672,7 @@ class DeepSeekProxyHandler:
                 cache_namespace,
                 response_contexts,
                 display_adapter,
-                original_model,
+                response_model,
                 recovery_notice,
             )
 
@@ -671,7 +680,7 @@ class DeepSeekProxyHandler:
         if (
             not self.config.display_reasoning
             and self.reasoning_store is None
-            and original_model == self.config.upstream_model
+            and response_model == self.config.upstream_model
         ):
             return line, False, recovery_notice, None
 
@@ -711,7 +720,7 @@ class DeepSeekProxyHandler:
             if display_adapter is not None:
                 display_adapter.rewrite_chunk(chunk)
             if "model" in chunk:
-                chunk["model"] = original_model
+                chunk["model"] = response_model
             ending = b"\r\n" if line.endswith(b"\r\n") else b"\n"
             return (
                 b"data: " + orjson.dumps(chunk) + ending,
@@ -727,7 +736,7 @@ class DeepSeekProxyHandler:
         cache_namespace: str,
         response_contexts: list[tuple[str, list[dict[str, Any]]]],
         display_adapter: CursorReasoningDisplayAdapter | None,
-        original_model: str,
+        response_model: str,
         recovery_notice: str | None,
     ) -> tuple[bytes, bool, str | None, dict[str, Any] | None]:
         if self.config.verbose:
@@ -751,15 +760,15 @@ class DeepSeekProxyHandler:
         if display_adapter is None:
             if recovery_notice:
                 prefix += sse_data(
-                    recovery_notice_chunk(original_model, recovery_notice)
+                    recovery_notice_chunk(response_model, recovery_notice)
                 )
             return prefix + b"data: [DONE]\n\n", True, None, None
-        closing_chunk = display_adapter.flush_chunk(original_model)
+        closing_chunk = display_adapter.flush_chunk(response_model)
         if closing_chunk is not None:
             prefix += sse_data(closing_chunk)
         if recovery_notice:
             prefix += sse_data(
-                recovery_notice_chunk(original_model, recovery_notice)
+                recovery_notice_chunk(response_model, recovery_notice)
             )
         return prefix + b"data: [DONE]\n\n", True, None, None
 
@@ -1300,13 +1309,28 @@ def log_send_summary(prepared: Any) -> None:
     )
 
 
-def log_stats_summary(usage: dict[str, Any] | None) -> None:
+def log_stats_summary(
+    usage: dict[str, Any] | None,
+    *,
+    response_model: str | None = None,
+) -> None:
+    if response_model is None:
+        LOG.info(
+            "\u2514 stats   prompt=%s output=%s reasoning=%s cache_hit=%s",
+            format_usage_count(usage, "prompt_tokens"),
+            format_usage_count(usage, "completion_tokens"),
+            format_count(reasoning_token_count(usage)),
+            cache_hit_rate(usage),
+        )
+        return
     LOG.info(
-        "\u2514 stats   prompt=%s output=%s reasoning=%s cache_hit=%s",
+        "\u2514 stats   prompt=%s output=%s reasoning=%s cache_hit=%s "
+        "response_model=%s",
         format_usage_count(usage, "prompt_tokens"),
         format_usage_count(usage, "completion_tokens"),
         format_count(reasoning_token_count(usage)),
         cache_hit_rate(usage),
+        response_model,
     )
 
 
@@ -1418,7 +1442,43 @@ def _clean_chunk_content_deltas(chunk: dict[str, Any]) -> None:
             continue
         content = delta.get("content")
         if isinstance(content, str):
-            delta["content"] = strip_tool_tags(content)
+            delta["content"] = normalize_assistant_content(
+                strip_tool_tags(content)
+            )
+
+
+def _warn_if_empty_upstream_response(body: bytes, response_model: str) -> None:
+    try:
+        payload = orjson.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    usage = payload.get("usage")
+    completion_tokens = 0
+    if isinstance(usage, dict):
+        completion_tokens = int_or_zero(usage.get("completion_tokens"))
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if content not in (None, "") and not (
+            isinstance(content, str) and not content.strip()
+        ):
+            return
+        if message.get("tool_calls"):
+            return
+    LOG.warning(
+        "upstream returned empty assistant content model=%s completion_tokens=%s",
+        response_model,
+        completion_tokens,
+    )
 
 
 def inject_recovery_notice(

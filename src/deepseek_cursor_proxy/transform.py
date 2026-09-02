@@ -98,6 +98,11 @@ CURSOR_THINKING_BLOCK_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+QWEN_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<tool_call>\s*([\s\S]*?)\s*</tool_call>",
+    re.IGNORECASE,
+)
+
 RECOVERY_NOTICE_TEXT = "[deepseek-cursor-proxy] Refreshed reasoning_content history."
 RECOVERY_NOTICE_CONTENT = f"{RECOVERY_NOTICE_TEXT}\n\n"
 RECOVERY_SYSTEM_CONTENT = (
@@ -755,6 +760,43 @@ def upstream_model_for(original_model: str, config: ProxyConfig) -> str:
     return config.upstream_model
 
 
+def client_response_model(
+    original_model: str,
+    upstream_model: str,
+    config: ProxyConfig,
+) -> str:
+    """Model name returned to the OpenAI client in responses."""
+    if is_deepseek_upstream(config.upstream_base_url):
+        return original_model
+    return upstream_model
+
+
+def normalize_assistant_content(content: Any) -> Any:
+    """Unwrap Qwen-style ``<tool_call>`` markup into plain JSON/text."""
+    if not isinstance(content, str) or not content:
+        return content
+    match = QWEN_TOOL_CALL_BLOCK_RE.search(content)
+    if not match:
+        return content
+    inner = match.group(1).strip()
+    return inner if inner else content
+
+
+def normalize_response_content(response_payload: dict[str, Any]) -> None:
+    choices = response_payload.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if isinstance(message, dict) and "content" in message:
+            message["content"] = normalize_assistant_content(message.get("content"))
+        delta = choice.get("delta")
+        if isinstance(delta, dict) and "content" in delta:
+            delta["content"] = normalize_assistant_content(delta.get("content"))
+
+
 def reasoning_model_family(upstream_model: str) -> str:
     if upstream_model in {"deepseek-v4-pro", "deepseek-v4-flash"}:
         return "deepseek-v4"
@@ -879,13 +921,19 @@ def prepare_upstream_request(
         if tool_choice is not None:
             prepared["tool_choice"] = tool_choice
 
-    prepared["thinking"] = {"type": config.thinking}
     thinking_enabled = config.thinking == "enabled"
     thinking_disabled = config.thinking == "disabled"
-    if thinking_enabled:
-        prepared["reasoning_effort"] = normalize_reasoning_effort(
-            config.reasoning_effort
-        )
+    if is_deepseek_upstream(config.upstream_base_url):
+        prepared["thinking"] = {"type": config.thinking}
+        if thinking_enabled:
+            prepared["reasoning_effort"] = normalize_reasoning_effort(
+                config.reasoning_effort
+            )
+    else:
+        prepared.pop("thinking", None)
+        prepared.pop("reasoning_effort", None)
+        thinking_enabled = False
+        thinking_disabled = True
 
     cache_namespace = reasoning_cache_namespace(
         config,
@@ -1031,7 +1079,7 @@ def record_response_reasoning(
 
 def rewrite_response_body(
     body: bytes,
-    original_model: str,
+    response_model: str,
     store: ReasoningStore | None,
     request_messages: list[dict[str, Any]],
     cache_namespace: str = "",
@@ -1046,6 +1094,7 @@ def rewrite_response_body(
     if isinstance(response_payload, dict):
         if content_prefix:
             prefix_response_content(response_payload, content_prefix)
+        normalize_response_content(response_payload)
         record_response_reasoning(
             response_payload,
             store,
@@ -1058,7 +1107,7 @@ def rewrite_response_body(
         if display_reasoning:
             fold_reasoning_into_content(response_payload, collapsible_reasoning)
         if "model" in response_payload:
-            response_payload["model"] = original_model
+            response_payload["model"] = response_model
     return orjson.dumps(response_payload)
 
 
